@@ -159,6 +159,71 @@ func TestMultipleClients(t *testing.T) {
 	}
 }
 
+// TestJoinWithPartyID verifies that a client can successfully join
+// an existing party with its PartyID.
+func TestJoinWithPartyID(t *testing.T) {
+	srv, _ := startTestServer(t)
+	connA := wsDial(t, srv)
+	connB := wsDial(t, srv)
+	defer connA.Close()
+	defer connB.Close()
+
+	// eat connectSuccess messages
+	_ = readMessage(t, connA, timeout)
+	_ = readMessage(t, connB, timeout)
+
+	// A joins with empty partyId and enters queue
+	payloadA := json.RawMessage(`{"partyId": ""}`)
+	sendMessage(t, connA, ClientMessage{Type: ClientMessageJoin, Payload: payloadA})
+
+	// Expect QueueJoined and then PartyJoined for A
+	queueMsgA := readMessage(t, connA, timeout)
+	if queueMsgA.Type != ServerMessageQueueJoined {
+		t.Fatalf("expected queueJoined for A, got %s", queueMsgA.Type)
+	}
+
+	joinedMsgA := readMessage(t, connA, 2*timeout)
+	if joinedMsgA.Type != ServerMessagePartyJoined {
+		t.Fatalf("expected partyJoined for A, got %s", joinedMsgA.Type)
+	}
+
+	// Extract PartyID from A's partyJoined message
+	payloadAny, err := UnmarshalServerMessage(joinedMsgA)
+	if err != nil {
+		t.Fatalf("failed to unmarshal payload for A: %v", err)
+	}
+	joinedPayload, ok := payloadAny.(ServerMessagePartyJoinedPayload)
+	if !ok {
+		t.Fatalf("unexpected payload type for partyJoined: %T", payloadAny)
+	}
+
+	t.Logf("Client A joined party %s", joinedPayload.PartyID)
+
+	// B joins A's specific party
+	rawB, _ := json.Marshal(map[string]any{"partyId": joinedPayload.PartyID})
+	sendMessage(t, connB, ClientMessage{Type: ClientMessageJoin, Payload: json.RawMessage(rawB)})
+
+	// Expect B to receive PartyJoined for the same PartyID
+	msgB := readMessage(t, connB, 2*timeout)
+	if msgB.Type != ServerMessagePartyJoined {
+		t.Fatalf("expected partyJoined for B, got %s", msgB.Type)
+	}
+
+	payloadB, err := UnmarshalServerMessage(msgB)
+	if err != nil {
+		t.Fatalf("failed to unmarshal payload for B: %v", err)
+	}
+	bJoinedPayload, ok := payloadB.(ServerMessagePartyJoinedPayload)
+	if !ok {
+		t.Fatalf("unexpected payload type for B: %T", payloadB)
+	}
+
+	if joinedPayload.PartyID != bJoinedPayload.PartyID {
+		t.Fatalf("expected both clients in same party, got %s and %s",
+			joinedPayload.PartyID, bJoinedPayload.PartyID)
+	}
+}
+
 // TestMalformedMessages ensures that completely invalid payloads
 // trigger an error message.
 func TestMalformedMessages(t *testing.T) {
