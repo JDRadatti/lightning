@@ -21,13 +21,14 @@ const (
 )
 
 const (
-	ErrorCodeInvalidRequest ServerErrorCode = "invalidRequest"
-	ErrorCodeAlreadyInParty ServerErrorCode = "alreadyInParty"
-	ErrorCodePartyNotFound  ServerErrorCode = "partyNotFound"
-	ErrorCodeNotPartyHost   ServerErrorCode = "notPartyHost"
-	ErrorCodeNotInSession   ServerErrorCode = "notInSession"
-	ErrorCodePartyFull      ServerErrorCode = "partyFull"
-	ErrorCodeQueueFull      ServerErrorCode = "queueFull"
+	ErrorCodeInvalidRequest   ServerErrorCode = "invalidRequest"
+	ErrorCodeAlreadyInParty   ServerErrorCode = "alreadyInParty"
+	ErrorCodePartyNotFound    ServerErrorCode = "partyNotFound"
+	ErrorCodeNotPartyHost     ServerErrorCode = "notPartyHost"
+	ErrorCodeNotEnoughMembers ServerErrorCode = "notEnoughMembers"
+	ErrorCodeNotInSession     ServerErrorCode = "notInSession"
+	ErrorCodePartyFull        ServerErrorCode = "partyFull"
+	ErrorCodeQueueFull        ServerErrorCode = "queueFull"
 )
 
 const (

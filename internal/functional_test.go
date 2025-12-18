@@ -442,3 +442,43 @@ func TestNonHostCannotStartGame(t *testing.T) {
 
 	t.Logf("Server successfully rejected non-host start attempt with message: %s", plErr.Message)
 }
+
+// TestGameCannotStartWithSinglePlayer verifies that the server returns an error
+// when the host attempts to start a game while being the only member.
+func TestGameCannotStartWithSinglePlayer(t *testing.T) {
+	srv, _ := startTestServer(t)
+
+	// 1. Connect Client A (Host)
+	connA := wsDial(t, srv)
+	defer connA.Close()
+
+	// Consume connectSuccess
+	_ = readMessage(t, connA, timeout)
+
+	// Client A joins to create a party
+	sendMessage(t, connA, ClientMessage{Type: ClientMessageJoin, Payload: json.RawMessage(`{"partyId": ""}`)})
+	_ = readMessage(t, connA, timeout) // queueJoined
+	_ = readMessage(t, connA, timeout) // partyJoined
+	_ = readMessage(t, connA, timeout) // memberUpdate
+
+	// Host (A) attempts to start the game alone
+	sendMessage(t, connA, ClientMessage{
+		Type:    ClientMessageStartGame,
+		Payload: json.RawMessage(`{}`),
+	})
+
+	// Validation: Client A should receive an ErrorMessage (ErrorCodeNotEnoughMembers)
+	msgError := readMessage(t, connA, timeout)
+	if msgError.Type != ServerMessageError {
+		t.Fatalf("expected error message from under-populated start attempt, got %s", msgError.Type)
+	}
+
+	// Verify the error code is specific to the member count requirement
+	payloadErr, _ := UnmarshalServerMessage(msgError)
+	plErr := payloadErr.(ServerMessageErrorPayload)
+	if plErr.Code != ErrorCodeNotEnoughMembers {
+		t.Fatalf("expected error code %s, got %s", ErrorCodeNotEnoughMembers, plErr.Code)
+	}
+
+	t.Logf("Server successfully rejected start attempt with 1 player: %s", plErr.Message)
+}

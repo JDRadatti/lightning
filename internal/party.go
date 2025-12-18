@@ -8,6 +8,7 @@ import (
 
 const (
 	maxPartySize      = 6
+	minPartySize      = 2
 	commandBufferSize = 64
 )
 
@@ -231,6 +232,11 @@ func (p *Party) handleCommand(cmd PartyCommand) {
 		// Only host can start the game
 		if c.ID != p.HostID {
 			c.SendError(ErrorCodeNotPartyHost, "Not party host.", ClientMessageStartGame)
+			return
+		}
+		// Only start game if there is enought players
+		if len(p.Members) < minPartySize {
+			c.SendError(ErrorCodeNotEnoughMembers, "Party size is too small.", ClientMessageStartGame)
 			return
 		}
 
