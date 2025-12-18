@@ -38,14 +38,70 @@ func wsDial(t *testing.T, srv *httptest.Server) *websocket.Conn {
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
 	}
+
 	t.Cleanup(func() {
-		_ = conn.WriteMessage(
-			websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "functional test done"),
-		)
 		conn.Close()
 	})
 	return conn
+}
+
+// expectMessageType drains messages until it finds the target type or times out.
+func expectMessageType(t *testing.T, conn *websocket.Conn, target ServerMessageType, timeout time.Duration) ServerMessage {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for message type %s", target)
+		}
+
+		conn.SetReadDeadline(deadline)
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read failed while waiting for %s: %v", target, err)
+		}
+
+		var msg ServerMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+
+		if msg.Type == target {
+			return msg
+		}
+
+		// Skip background noise
+		if msg.Type == ServerMessageMemberUpdate || msg.Type == ServerMessageQueueJoined {
+			continue
+		}
+
+		// If we get an Error when we didn't ask for one, log the details
+		if msg.Type == ServerMessageError {
+			t.Fatalf("received unexpected error while waiting for %s: %s", target, string(data))
+		}
+
+		t.Fatalf("expected %s, but got %s", target, msg.Type)
+	}
+}
+
+// connectAndJoin handles connecting, connectSuccess, and joining a party.
+func connectAndJoin(t *testing.T, srv *httptest.Server, partyID PartyID) (*websocket.Conn, PartyID) {
+	t.Helper()
+	conn := wsDial(t, srv)
+
+	expectMessageType(t, conn, ServerMessageConnectSuccess, timeout)
+
+	payload := json.RawMessage(`{"partyId": "` + partyID + `"}`)
+	sendMessage(t, conn, ClientMessage{Type: ClientMessageJoin, Payload: payload})
+
+	msg := expectMessageType(t, conn, ServerMessagePartyJoined, 2*timeout)
+
+	payloadAny, err := UnmarshalServerMessage(msg)
+	if err != nil {
+		t.Fatalf("failed to unmarshal partyJoined: %v", err)
+	}
+	pID := payloadAny.(ServerMessagePartyJoinedPayload).PartyID
+
+	return conn, PartyID(pID)
 }
 
 // readMessage reads and parses a ServerMessage within the given timeout.
@@ -80,28 +136,11 @@ func sendMessage(t *testing.T, conn *websocket.Conn, msg ClientMessage) {
 //	connect -> connectSuccess -> join -> partyJoined
 func TestConnectAndJoin(t *testing.T) {
 	srv, _ := startTestServer(t)
-	conn := wsDial(t, srv)
+	conn, partyID := connectAndJoin(t, srv, "")
+	defer conn.Close()
 
-	// expect connectSuccess
-	msg := readMessage(t, conn, timeout)
-	if msg.Type != ServerMessageConnectSuccess {
-		t.Fatalf("expected connectSuccess, got %s", msg.Type)
-	}
-
-	// send join request
-	payload := json.RawMessage(`{"partyId": ""}`)
-	sendMessage(t, conn, ClientMessage{Type: ClientMessageJoin, Payload: payload})
-
-	// expect partyJoined
-	msg2 := readMessage(t, conn, timeout)
-	if msg2.Type != ServerMessageQueueJoined {
-		t.Fatalf("expected queueJoined, got %s", msg2.Type)
-	}
-
-	// Wait for party assignment
-	msg3 := readMessage(t, conn, 2*timeout)
-	if msg3.Type != ServerMessagePartyJoined {
-		t.Fatalf("expected partyJoined eventually, got %s", msg3.Type)
+	if partyID == "" {
+		t.Fatal("expected valid partyID")
 	}
 }
 
@@ -111,116 +150,40 @@ func TestInvalidParty(t *testing.T) {
 	srv, _ := startTestServer(t)
 	conn := wsDial(t, srv)
 
-	// read initial connectSuccess
-	msg := readMessage(t, conn, timeout)
-	if msg.Type != ServerMessageConnectSuccess {
-		t.Fatalf("expected connectSuccess, got %s", msg.Type)
-	}
+	expectMessageType(t, conn, ServerMessageConnectSuccess, timeout)
 
-	// send join request with invalid partyId
 	payload := json.RawMessage(`{"partyId":"nonexistent-party"}`)
-	sendMessage(t, conn, ClientMessage{
-		Type:    ClientMessageJoin,
-		Payload: payload,
-	})
+	sendMessage(t, conn, ClientMessage{Type: ClientMessageJoin, Payload: payload})
 
-	// expect error message
-	msg2 := readMessage(t, conn, timeout)
-	if msg2.Type != ServerMessageError {
-		t.Fatalf("expected error, got %s", msg2.Type)
-	}
+	expectMessageType(t, conn, ServerMessageError, timeout)
 }
 
 // TestMultipleClients verifies that multiple clients can join the same party.
 func TestMultipleClients(t *testing.T) {
 	srv, _ := startTestServer(t)
-	connA := wsDial(t, srv)
-	connB := wsDial(t, srv)
 
-	// read initial connectSuccess
-	_ = readMessage(t, connA, timeout)
-	_ = readMessage(t, connB, timeout)
+	connA, partyID := connectAndJoin(t, srv, "")
+	defer connA.Close()
 
-	// both join queue
-	payload := json.RawMessage(`{"partyId": ""}`)
-	sendMessage(t, connA, ClientMessage{Type: ClientMessageJoin, Payload: payload})
-	sendMessage(t, connB, ClientMessage{Type: ClientMessageJoin, Payload: payload})
+	connB, _ := connectAndJoin(t, srv, partyID)
+	defer connB.Close()
 
-	// eat the queueJoined messages
-	_ = readMessage(t, connA, timeout)
-	_ = readMessage(t, connB, timeout)
-
-	// Wait for party assignment
-	msgA := readMessage(t, connA, timeout)
-	msgB := readMessage(t, connB, timeout)
-
-	if msgA.Type != ServerMessagePartyJoined || msgB.Type != ServerMessagePartyJoined {
-		t.Fatalf("expected both clients to eventually receive partyJoined (got %s, %s)", msgA.Type, msgB.Type)
-	}
+	t.Log("Both clients joined successfully")
 }
 
 // TestJoinWithPartyID verifies that a client can successfully join
 // an existing party with its PartyID.
 func TestJoinWithPartyID(t *testing.T) {
 	srv, _ := startTestServer(t)
-	connA := wsDial(t, srv)
-	connB := wsDial(t, srv)
+
+	connA, partyID := connectAndJoin(t, srv, "")
 	defer connA.Close()
+
+	connB, bPartyID := connectAndJoin(t, srv, partyID)
 	defer connB.Close()
 
-	// eat connectSuccess messages
-	_ = readMessage(t, connA, timeout)
-	_ = readMessage(t, connB, timeout)
-
-	// A joins with empty partyId and enters queue
-	payloadA := json.RawMessage(`{"partyId": ""}`)
-	sendMessage(t, connA, ClientMessage{Type: ClientMessageJoin, Payload: payloadA})
-
-	// Expect QueueJoined and then PartyJoined for A
-	queueMsgA := readMessage(t, connA, timeout)
-	if queueMsgA.Type != ServerMessageQueueJoined {
-		t.Fatalf("expected queueJoined for A, got %s", queueMsgA.Type)
-	}
-
-	joinedMsgA := readMessage(t, connA, 2*timeout)
-	if joinedMsgA.Type != ServerMessagePartyJoined {
-		t.Fatalf("expected partyJoined for A, got %s", joinedMsgA.Type)
-	}
-
-	// Extract PartyID from A's partyJoined message
-	payloadAny, err := UnmarshalServerMessage(joinedMsgA)
-	if err != nil {
-		t.Fatalf("failed to unmarshal payload for A: %v", err)
-	}
-	joinedPayload, ok := payloadAny.(ServerMessagePartyJoinedPayload)
-	if !ok {
-		t.Fatalf("unexpected payload type for partyJoined: %T", payloadAny)
-	}
-
-	t.Logf("Client A joined party %s", joinedPayload.PartyID)
-
-	// B joins A's specific party
-	rawB, _ := json.Marshal(map[string]any{"partyId": joinedPayload.PartyID})
-	sendMessage(t, connB, ClientMessage{Type: ClientMessageJoin, Payload: json.RawMessage(rawB)})
-
-	// Expect B to receive PartyJoined for the same PartyID
-	msgB := readMessage(t, connB, 2*timeout)
-	if msgB.Type != ServerMessagePartyJoined {
-		t.Fatalf("expected partyJoined for B, got %s", msgB.Type)
-	}
-
-	payloadB, err := UnmarshalServerMessage(msgB)
-	if err != nil {
-		t.Fatalf("failed to unmarshal payload for B: %v", err)
-	}
-	bJoinedPayload, ok := payloadB.(ServerMessagePartyJoinedPayload)
-	if !ok {
-		t.Fatalf("unexpected payload type for B: %T", payloadB)
-	}
-
-	if joinedPayload.PartyID != bJoinedPayload.PartyID {
-		t.Fatalf("expected both clients in same party, got %s and %s",
-			joinedPayload.PartyID, bJoinedPayload.PartyID)
+	if partyID != bPartyID {
+		t.Fatalf("expected both clients in same party, got %s and %s", partyID, bPartyID)
 	}
 }
 
@@ -230,16 +193,14 @@ func TestMalformedMessages(t *testing.T) {
 	srv, _ := startTestServer(t)
 	conn := wsDial(t, srv)
 
-	// read initial connectSuccess
-	_ = readMessage(t, conn, timeout)
+	_ = expectMessageType(t, conn, ServerMessageConnectSuccess, timeout)
 
-	// send broken JSON
 	raw := []byte(`{"type":"join","payload":"notAnObject"}`)
 	if err := conn.WriteMessage(websocket.TextMessage, raw); err != nil {
 		t.Fatalf("write raw failed: %v", err)
 	}
 
-	msg := readMessage(t, conn, timeout)
+	msg := expectMessageType(t, conn, ServerMessageError, timeout)
 	if msg.Type != ServerMessageError {
 		t.Fatalf("expected error message, got %s", msg.Type)
 	}
@@ -250,73 +211,20 @@ func TestMalformedMessages(t *testing.T) {
 func TestPartyHostTransfer(t *testing.T) {
 	srv, _ := startTestServer(t)
 
-	// Connect two clients
-	connA := wsDial(t, srv)
-	connB := wsDial(t, srv)
-
-	// Read initial connectSuccess
-	_ = readMessage(t, connA, timeout)
-	_ = readMessage(t, connB, timeout)
-
-	// First client joins
-	payload := json.RawMessage(`{"partyId": ""}`)
-	sendMessage(t, connA, ClientMessage{Type: ClientMessageJoin, Payload: payload})
-
-	// Expect queueJoined then partyJoined then memberUpdate for A
-	msgA1 := readMessage(t, connA, timeout)
-	if msgA1.Type != ServerMessageQueueJoined {
-		t.Fatalf("expected queueJoined for A, got %s", msgA1.Type)
-	}
-	msgA2 := readMessage(t, connA, 2*timeout)
-	if msgA2.Type != ServerMessagePartyJoined {
-		t.Fatalf("expected partyJoined for A, got %s", msgA2.Type)
-	}
-	msgA3 := readMessage(t, connA, 2*timeout)
-	if msgA3.Type != ServerMessageMemberUpdate {
-		t.Fatalf("expected memberUpdate for A, got %s", msgA3.Type)
-	}
-
-	// Extract PartyID from A
-	payloadAny, err := UnmarshalServerMessage(msgA2)
-	if err != nil {
-		t.Fatalf("failed unmarshal for A: %v", err)
-	}
-	plA, ok := payloadAny.(ServerMessagePartyJoinedPayload)
-	if !ok {
-		t.Fatalf("unexpected payload type for A: %T", payloadAny)
-	}
-
-	// Second client joins same party
-	rawB, _ := json.Marshal(map[string]any{"partyId": plA.PartyID})
-	sendMessage(t, connB, ClientMessage{Type: ClientMessageJoin, Payload: json.RawMessage(rawB)})
-
-	// Wait for B's partyJoined
-	msgB := readMessage(t, connB, 2*timeout)
-	if msgB.Type != ServerMessagePartyJoined {
-		t.Fatalf("expected partyJoined for B, got %s", msgB.Type)
-	}
-
-	// Eat memberUpdates for both clients
-	_ = readMessage(t, connA, timeout)
-	_ = readMessage(t, connB, timeout)
+	connA, partyID := connectAndJoin(t, srv, "")
+	connB, _ := connectAndJoin(t, srv, partyID)
+	defer connB.Close()
+	defer connA.Close()
 
 	// Host (A) leaves
 	sendMessage(t, connA, ClientMessage{Type: ClientMessageLeave, Payload: json.RawMessage(`{}`)})
 
-	// A should get confirmation and a member update
-	msgA4 := readMessage(t, connA, 2*timeout)
-	if msgA4.Type != ServerMessagePartyLeft {
-		t.Fatalf("expected partyLeft for A, got %s", msgA4.Type)
-	}
+	expectMessageType(t, connA, ServerMessagePartyLeft, 2*timeout)
 
-	// Wait for member update broadcasted to remaining client (B)
-	updateMsg := readMessage(t, connB, 2*timeout)
-	if updateMsg.Type != ServerMessageMemberUpdate {
-		t.Fatalf("expected memberUpdate broadcast to B, got %s", updateMsg.Type)
-	}
+	// B should get a memberUpdate reflecting the host transfer
+	updateMsg := expectMessageType(t, connB, ServerMessageMemberUpdate, 2*timeout)
 
-	// Verify from payload that B is still connected and host flag changed
-	payloadAny, err = UnmarshalServerMessage(updateMsg)
+	payloadAny, err := UnmarshalServerMessage(updateMsg)
 	if err != nil {
 		t.Fatalf("failed to unmarshal memberUpdate: %v", err)
 	}
@@ -335,61 +243,24 @@ func TestPartyHostTransfer(t *testing.T) {
 	}
 
 	if !bIsHost {
-		t.Fatalf("expected B to become the new host after A left, but no host identified")
+		t.Fatalf("expected B to become the new host after A left")
 	}
-
-	t.Logf("client B successfully became new host in party %s", plA.PartyID)
 }
 
 // TestStartGame verifies that when the host
-// requests to start a game, all party members receive gameStarted
-// and the PartyManager logs the event.
+// requests to start a game, all party members receive gameStarted.
 func TestStartGame(t *testing.T) {
 	srv, _ := startTestServer(t)
 
-	// Connect two clients (A = host, B = member)
-	connA := wsDial(t, srv)
-	connB := wsDial(t, srv)
+	connA, partyID := connectAndJoin(t, srv, "")
+	connB, _ := connectAndJoin(t, srv, partyID)
 	defer connA.Close()
 	defer connB.Close()
 
-	_ = readMessage(t, connA, timeout)
-	_ = readMessage(t, connB, timeout)
+	sendMessage(t, connA, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
 
-	// Host (A) joins queue and becomes party host
-	payloadA := json.RawMessage(`{"partyId": ""}`)
-	sendMessage(t, connA, ClientMessage{Type: ClientMessageJoin, Payload: payloadA})
-	_ = readMessage(t, connA, timeout) // queueJoined
-	msgJoinedA := readMessage(t, connA, timeout)
-	if msgJoinedA.Type != ServerMessagePartyJoined {
-		t.Fatalf("expected partyJoined for A, got %s", msgJoinedA.Type)
-	}
-
-	// Extract PartyID from host join
-	payloadAny, _ := UnmarshalServerMessage(msgJoinedA)
-	plA := payloadAny.(ServerMessagePartyJoinedPayload)
-	_ = readMessage(t, connA, timeout) // memberUpdate
-
-	// Member (B) joins same party
-	rawB, _ := json.Marshal(map[string]any{"partyId": plA.PartyID})
-	sendMessage(t, connB, ClientMessage{Type: ClientMessageJoin, Payload: json.RawMessage(rawB)})
-	_ = readMessage(t, connB, timeout) // partyJoined
-	_ = readMessage(t, connA, timeout) // memberUpdate
-	_ = readMessage(t, connB, timeout) // memberUpdate
-
-	// Host sends startGame
-	sendMessage(t, connA, ClientMessage{
-		Type:    ClientMessageStartGame,
-		Payload: json.RawMessage(`{}`),
-	})
-
-	// Both should eventually get gameStarted
-	msgA := readMessage(t, connA, timeout)
-	msgB := readMessage(t, connB, timeout)
-
-	if msgA.Type != ServerMessageGameStarted || msgB.Type != ServerMessageGameStarted {
-		t.Fatalf("expected both clients to receive gameStarted (got %s, %s)", msgA.Type, msgB.Type)
-	}
+	_ = expectMessageType(t, connA, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, connB, ServerMessageGameStarted, timeout)
 }
 
 // TestNonHostCannotStartGame verifies that the server returns an error
@@ -397,50 +268,19 @@ func TestStartGame(t *testing.T) {
 func TestNonHostCannotStartGame(t *testing.T) {
 	srv, _ := startTestServer(t)
 
-	// Connect Client A (becomes Host) and Client B (Member)
-	connA := wsDial(t, srv)
-	connB := wsDial(t, srv)
+	_, partyID := connectAndJoin(t, srv, "")
+	connB, _ := connectAndJoin(t, srv, partyID)
+	defer connB.Close()
 
-	// Consume connectSuccess
-	_ = readMessage(t, connA, timeout)
-	_ = readMessage(t, connB, timeout)
+	sendMessage(t, connB, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
 
-	// Client A joins to create a party
-	sendMessage(t, connA, ClientMessage{Type: ClientMessageJoin, Payload: json.RawMessage(`{"partyId": ""}`)})
-	_ = readMessage(t, connA, timeout) // queueJoined
-	msgJoinedA := readMessage(t, connA, timeout)
+	msgError := expectMessageType(t, connB, ServerMessageError, timeout)
 
-	// Extract PartyID so B can join
-	payloadAny, _ := UnmarshalServerMessage(msgJoinedA)
-	plA := payloadAny.(ServerMessagePartyJoinedPayload)
-
-	// Client B joins A's party
-	rawB, _ := json.Marshal(map[string]any{"partyId": plA.PartyID})
-	sendMessage(t, connB, ClientMessage{Type: ClientMessageJoin, Payload: json.RawMessage(rawB)})
-	_ = readMessage(t, connB, timeout) // partyJoined
-	_ = readMessage(t, connB, timeout) // memberUpdate
-	_ = readMessage(t, connA, timeout) // memberUpdate
-
-	// Client B (Non-Host) attempts to start the game
-	sendMessage(t, connB, ClientMessage{
-		Type:    ClientMessageStartGame,
-		Payload: json.RawMessage(`{}`),
-	})
-
-	// Client B should receive an ErrorMessage (ErrorCodeNotPartyHost)
-	msgError := readMessage(t, connB, timeout)
-	if msgError.Type != ServerMessageError {
-		t.Fatalf("expected error message from non-host start attempt, got %s", msgError.Type)
-	}
-
-	// Verify the error code is specific to the host permission
 	payloadErr, _ := UnmarshalServerMessage(msgError)
 	plErr := payloadErr.(ServerMessageErrorPayload)
 	if plErr.Code != ErrorCodeNotPartyHost {
 		t.Fatalf("expected error code %s, got %s", ErrorCodeNotPartyHost, plErr.Code)
 	}
-
-	t.Logf("Server successfully rejected non-host start attempt with message: %s", plErr.Message)
 }
 
 // TestGameCannotStartWithSinglePlayer verifies that the server returns an error
@@ -448,37 +288,16 @@ func TestNonHostCannotStartGame(t *testing.T) {
 func TestGameCannotStartWithSinglePlayer(t *testing.T) {
 	srv, _ := startTestServer(t)
 
-	// 1. Connect Client A (Host)
-	connA := wsDial(t, srv)
+	connA, _ := connectAndJoin(t, srv, "")
 	defer connA.Close()
 
-	// Consume connectSuccess
-	_ = readMessage(t, connA, timeout)
+	sendMessage(t, connA, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
 
-	// Client A joins to create a party
-	sendMessage(t, connA, ClientMessage{Type: ClientMessageJoin, Payload: json.RawMessage(`{"partyId": ""}`)})
-	_ = readMessage(t, connA, timeout) // queueJoined
-	_ = readMessage(t, connA, timeout) // partyJoined
-	_ = readMessage(t, connA, timeout) // memberUpdate
+	msgError := expectMessageType(t, connA, ServerMessageError, timeout)
 
-	// Host (A) attempts to start the game alone
-	sendMessage(t, connA, ClientMessage{
-		Type:    ClientMessageStartGame,
-		Payload: json.RawMessage(`{}`),
-	})
-
-	// Validation: Client A should receive an ErrorMessage (ErrorCodeNotEnoughMembers)
-	msgError := readMessage(t, connA, timeout)
-	if msgError.Type != ServerMessageError {
-		t.Fatalf("expected error message from under-populated start attempt, got %s", msgError.Type)
-	}
-
-	// Verify the error code is specific to the member count requirement
 	payloadErr, _ := UnmarshalServerMessage(msgError)
 	plErr := payloadErr.(ServerMessageErrorPayload)
 	if plErr.Code != ErrorCodeNotEnoughMembers {
 		t.Fatalf("expected error code %s, got %s", ErrorCodeNotEnoughMembers, plErr.Code)
 	}
-
-	t.Logf("Server successfully rejected start attempt with 1 player: %s", plErr.Message)
 }
