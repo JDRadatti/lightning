@@ -30,6 +30,7 @@ type PartyManagerCommandType string
 const (
 	PartyManagerCommandAddClient    PartyManagerCommandType = "addClient"
 	PartyManagerCommandRemoveClient PartyManagerCommandType = "removeClient"
+	PartyManagerCommandStartGame    PartyManagerCommandType = "startGame"
 )
 
 // PartyManagerCommand wraps a command and its payload,
@@ -49,6 +50,12 @@ type PartyManagerAddClientPayload struct {
 // PartyManagerRemoveClientPayload is used when a Client wants to leave
 // a Party or disconnects.
 type PartyManagerRemoveClientPayload struct {
+	Client *Client
+}
+
+// PartyManagerStartGamePayload is sent when a Client wants to
+// start a Game.
+type PartyManagerStartGamePayload struct {
 	Client *Client
 }
 
@@ -140,6 +147,30 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 		client := payload.Client
 
 		pm.removeClientFromParty(client, ClientMessageLeave)
+
+	case PartyManagerCommandStartGame:
+		payload := cmd.Payload.(PartyManagerStartGamePayload)
+		client := payload.Client
+		// get the client's party
+		pid, exists := pm.Members[client.ID]
+		if !exists {
+			client.SendError(ErrorCodeNotInSession, "No session found.", ClientMessageStartGame)
+			return
+		}
+
+		// attempt to get the party
+		p, exists := pm.Parties[pid]
+		if !exists && p != nil {
+			client.SendError(ErrorCodePartyNotFound, "Party not found", ClientMessageJoin)
+			return
+		}
+
+		p.SendCommand(PartyCommand{
+			Type: PartyCommandStartGame,
+			Payload: PartyCommandStartGamePayload{
+				Client: client,
+			},
+		})
 
 	default:
 		log.Printf("Unknown party manager command %s", cmd.Type)

@@ -80,6 +80,13 @@ func (c *Client) readPump() {
 					Payload: PartyManagerRemoveClientPayload{Client: c},
 				})
 			}
+		case ClientMessageStartGame:
+			if _, ok := payload.(ClientMessageStartGamePayload); ok {
+				c.pm.SendCommand(PartyManagerCommand{
+					Type:    PartyManagerCommandStartGame,
+					Payload: PartyManagerStartGamePayload{Client: c},
+				})
+			}
 		default:
 			c.SendError(ErrorCodeInvalidRequest, "Unknown request.", msg.Type)
 		}

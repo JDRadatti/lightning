@@ -74,6 +74,12 @@ type PartyCommandAddClientPayload struct {
 	Client *Client
 }
 
+// PartyCommandStartGamePayload carries info for starting a game. Client must be
+// the host.
+type PartyCommandStartGamePayload struct {
+	Client *Client
+}
+
 // ---------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------
@@ -174,6 +180,22 @@ func (p *Party) handleCommand(cmd PartyCommand) {
 		c := pl.Client
 		delete(p.Members, c.ID)
 
+		// Send PartyManager a confirmation
+		p.pm.PartyEvents <- PartyEvent{
+			Type:    PartyEventClientLeft,
+			PartyID: p.ID,
+			Payload: PartyEventClientLeftPayload{ClientID: c.ID},
+		}
+
+		// If host left, disband this party
+		if len(p.Members) == 0 {
+			p.pm.PartyEvents <- PartyEvent{Type: PartyEventDisbanded, PartyID: p.ID}
+			c.SendMessage(ServerMessagePartyLeft, ServerMessagePartyLeftPayload{
+				Reason: "party-disbanded",
+			})
+			return
+		}
+
 		// Check if host left
 		if p.HostID == c.ID {
 			if len(p.Members) == 0 {
@@ -201,12 +223,6 @@ func (p *Party) handleCommand(cmd PartyCommand) {
 				Members: p.getMemberInfo(),
 			},
 		)
-
-		p.pm.PartyEvents <- PartyEvent{
-			Type:    PartyEventClientLeft,
-			PartyID: p.ID,
-			Payload: PartyEventClientLeftPayload{ClientID: c.ID},
-		}
 
 	case PartyCommandStartGame:
 		game := NewGame(p.pm)

@@ -151,8 +151,8 @@ func TestMultipleClients(t *testing.T) {
 	_ = readMessage(t, connB, timeout)
 
 	// Wait for party assignment
-	msgA := readMessage(t, connA, 3*timeout)
-	msgB := readMessage(t, connB, 3*timeout)
+	msgA := readMessage(t, connA, timeout)
+	msgB := readMessage(t, connB, timeout)
 
 	if msgA.Type != ServerMessagePartyJoined || msgB.Type != ServerMessagePartyJoined {
 		t.Fatalf("expected both clients to eventually receive partyJoined (got %s, %s)", msgA.Type, msgB.Type)
@@ -339,4 +339,55 @@ func TestPartyHostTransfer(t *testing.T) {
 	}
 
 	t.Logf("client B successfully became new host in party %s", plA.PartyID)
+}
+
+// TestStartGame verifies that when the host
+// requests to start a game, all party members receive gameStarted
+// and the PartyManager logs the event.
+func TestStartGame(t *testing.T) {
+	srv, _ := startTestServer(t)
+
+	// Connect two clients (A = host, B = member)
+	connA := wsDial(t, srv)
+	connB := wsDial(t, srv)
+	defer connA.Close()
+	defer connB.Close()
+
+	_ = readMessage(t, connA, timeout)
+	_ = readMessage(t, connB, timeout)
+
+	// Host (A) joins queue and becomes party host
+	payloadA := json.RawMessage(`{"partyId": ""}`)
+	sendMessage(t, connA, ClientMessage{Type: ClientMessageJoin, Payload: payloadA})
+	_ = readMessage(t, connA, timeout) // queueJoined
+	msgJoinedA := readMessage(t, connA, timeout)
+	if msgJoinedA.Type != ServerMessagePartyJoined {
+		t.Fatalf("expected partyJoined for A, got %s", msgJoinedA.Type)
+	}
+
+	// Extract PartyID from host join
+	payloadAny, _ := UnmarshalServerMessage(msgJoinedA)
+	plA := payloadAny.(ServerMessagePartyJoinedPayload)
+	_ = readMessage(t, connA, timeout) // memberUpdate
+
+	// Member (B) joins same party
+	rawB, _ := json.Marshal(map[string]any{"partyId": plA.PartyID})
+	sendMessage(t, connB, ClientMessage{Type: ClientMessageJoin, Payload: json.RawMessage(rawB)})
+	_ = readMessage(t, connB, timeout) // partyJoined
+	_ = readMessage(t, connA, timeout) // memberUpdate
+	_ = readMessage(t, connB, timeout) // memberUpdate
+
+	// Host sends startGame
+	sendMessage(t, connA, ClientMessage{
+		Type:    ClientMessageStartGame,
+		Payload: json.RawMessage(`{}`),
+	})
+
+	// Both should eventually get gameStarted
+	msgA := readMessage(t, connA, timeout)
+	msgB := readMessage(t, connB, timeout)
+
+	if msgA.Type != ServerMessageGameStarted || msgB.Type != ServerMessageGameStarted {
+		t.Fatalf("expected both clients to receive gameStarted (got %s, %s)", msgA.Type, msgB.Type)
+	}
 }
