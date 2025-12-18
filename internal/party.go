@@ -19,6 +19,17 @@ func NewPartyID() PartyID {
 	return PartyID(uuid.New().String())
 }
 
+// PartyMemberInfo contains relevant information for
+// each party member, like connection status and
+// whether they are a host or not. This information
+// is sent to the client each time a member's status
+// is updated.
+type PartyMemberInfo struct {
+	ID        string `json:"id"`
+	IsHost    bool   `json:"isHost"`
+	Connected bool   `json:"connected"`
+}
+
 // ---------------------------------------------------------------------
 // Communication
 // ---------------------------------------------------------------------
@@ -73,6 +84,7 @@ type PartyEventType string
 const (
 	PartyEventClientJoined PartyEventType = "clientJoined"
 	PartyEventClientLeft   PartyEventType = "clientLeft"
+	PartyEventDisbanded    PartyEventType = "partyDisbanded"
 )
 
 // PartyEvent represents events sent from a Party to the PartyManager.
@@ -162,13 +174,34 @@ func (p *Party) handleCommand(cmd PartyCommand) {
 		c := pl.Client
 		delete(p.Members, c.ID)
 
+		// Check if host left
+		if p.HostID == c.ID {
+			if len(p.Members) == 0 {
+				// No members left, disband
+				p.pm.PartyEvents <- PartyEvent{
+					Type:    PartyEventDisbanded,
+					PartyID: p.ID,
+				}
+				return
+			} else {
+				// Pick the first remaining member as new host
+				for id := range p.Members {
+					p.HostID = id
+					break
+				}
+			}
+		}
+
 		c.SendMessage(ServerMessagePartyLeft, map[string]any{
 			"reason": "self-initiated",
 		})
 
-		p.broadcast(ServerMessageMemberUpdate, map[string]any{
-			"memberCount": len(p.Members),
-		})
+		p.broadcast(ServerMessageMemberUpdate,
+			ServerMessageMemberUpdatePayload{
+				Members: p.getMemberInfo(),
+			},
+		)
+
 		p.pm.PartyEvents <- PartyEvent{
 			Type:    PartyEventClientLeft,
 			PartyID: p.ID,
@@ -206,4 +239,16 @@ func (p *Party) broadcast(msgType ServerMessageType, payload any) {
 	for _, c := range p.Members {
 		c.SendMessage(msgType, payload)
 	}
+}
+
+func (p *Party) getMemberInfo() []PartyMemberInfo {
+	partyMembers := make([]PartyMemberInfo, 0, len(p.Members))
+	for _, m := range p.Members {
+		partyMembers = append(partyMembers, PartyMemberInfo{
+			ID:        string(m.ID),
+			IsHost:    p.HostID == m.ID,
+			Connected: true,
+		})
+	}
+	return partyMembers
 }

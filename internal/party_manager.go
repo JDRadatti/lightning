@@ -64,6 +64,7 @@ type PartyManagerRemoveClientPayload struct {
 type PartyManager struct {
 	PublicParty *Party
 	Parties     map[PartyID]*Party
+	Members     map[ClientID]PartyID
 	PublicQueue chan *Client
 
 	PartyEvents chan PartyEvent
@@ -76,6 +77,7 @@ func NewPartyManager() *PartyManager {
 	pm := &PartyManager{
 		PublicParty: nil,
 		Parties:     make(map[PartyID]*Party),
+		Members:     make(map[ClientID]PartyID),
 		PublicQueue: make(chan *Client, partyManagerBufferSize),
 		PartyEvents: make(chan PartyEvent, partyManagerBufferSize),
 		GameEvents:  make(chan GameEvent, partyManagerBufferSize),
@@ -137,13 +139,11 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 		payload := cmd.Payload.(PartyManagerRemoveClientPayload)
 		client := payload.Client
 
-		// NOTE: inefficient but safe; consider adding a map[ClientID] => PartyID later.
-		for _, p := range pm.Parties {
-			p.SendCommand(PartyCommand{
-				Type:    PartyCommandRemoveClient,
-				Payload: PartyCommandRemoveClientPayload{Client: client},
-			})
-		}
+		pm.removeClientFromParty(client, ClientMessageLeave)
+
+	default:
+		log.Printf("Unknown party manager command %s", cmd.Type)
+
 	}
 }
 
@@ -165,14 +165,29 @@ func (pm *PartyManager) handleQueueJoin(c *Client) {
 }
 
 // handlePartyEvent responds to events emitted by Parties.
+//
+// Most PartyManager state should be updated here. For example,
+// Only add a Client as a Member when they were sucessfully
+// added to a party (i.e. when PartyManager recieves a
+// PartyEventClientJoinedPayload)
 func (pm *PartyManager) handlePartyEvent(evt PartyEvent) {
 	switch evt.Type {
 	case PartyEventClientJoined:
 		pl := evt.Payload.(PartyEventClientJoinedPayload)
+		pm.Members[pl.ClientID] = evt.PartyID
 		log.Printf("Client %s joined party %s", pl.ClientID, evt.PartyID)
 
 	case PartyEventClientLeft:
+		pl := evt.Payload.(PartyEventClientLeftPayload)
+		delete(pm.Members, pl.ClientID)
 		log.Printf("Client left party %s", evt.PartyID)
+
+	case PartyEventDisbanded:
+		delete(pm.Parties, evt.PartyID)
+		log.Printf("Party disbanded %s", evt.PartyID)
+
+	default:
+		log.Printf("Unknonwn party event type %s", evt.Type)
 	}
 }
 
@@ -183,6 +198,8 @@ func (pm *PartyManager) handleGameEvent(evt GameEvent) {
 		log.Printf("Game %s started", evt.GameID)
 	case GameEventEnded:
 		log.Printf("Game %s ended", evt.GameID)
+	default:
+		log.Printf("Unknown game event type %s", evt.Type)
 	}
 }
 
@@ -194,4 +211,25 @@ func (pm *PartyManager) SendCommand(cmd PartyManagerCommand) {
 	default:
 		log.Println("PartyManager command buffer full")
 	}
+}
+
+// removeClientFromParty removes a client from a party
+func (pm *PartyManager) removeClientFromParty(c *Client, cmt ClientMessageType) {
+	pid, exists := pm.Members[c.ID]
+	if !exists {
+		c.SendError(ErrorCodeNotInSession, "Not in any party", cmt)
+		return
+	}
+
+	p, exists := pm.Parties[pid]
+	if !exists {
+		delete(pm.Members, c.ID)
+		c.SendError(ErrorCodePartyNotFound, "Party not found", cmt)
+		return
+	}
+
+	p.SendCommand(PartyCommand{
+		Type:    PartyCommandRemoveClient,
+		Payload: PartyCommandRemoveClientPayload{Client: c},
+	})
 }

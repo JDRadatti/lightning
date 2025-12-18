@@ -15,7 +15,7 @@ const (
 	ServerMessagePartyLeft      ServerMessageType = "partyLeft"
 	ServerMessageQueueJoined    ServerMessageType = "queueJoined"
 	ServerMessageError          ServerMessageType = "error"
-	ServerMessageMemberUpdate   ServerMessageType = "error"
+	ServerMessageMemberUpdate   ServerMessageType = "memberUpdate"
 	ServerMessageGameOver       ServerMessageType = "gameOver"
 	ServerMessageGameStarted    ServerMessageType = "gameStarted"
 )
@@ -24,6 +24,7 @@ const (
 	ErrorCodeInvalidRequest ServerErrorCode = "invalidRequest"
 	ErrorCodeAlreadyInParty ServerErrorCode = "alreadyInParty"
 	ErrorCodePartyNotFound  ServerErrorCode = "partyNotFound"
+	ErrorCodeNotInSession   ServerErrorCode = "notInSession"
 	ErrorCodePartyFull      ServerErrorCode = "partyFull"
 	ErrorCodeQueueFull      ServerErrorCode = "queueFull"
 )
@@ -51,9 +52,7 @@ type ClientMessageStartGamePayload struct {
 	PartyID PartyID `json:"partyId"`
 }
 
-type ClientMessageLeavePayload struct {
-	PartyID PartyID `json:"partyId"`
-}
+type ClientMessageLeavePayload struct{}
 
 // ---------------------------------------------------------------------
 // Server Messages
@@ -80,6 +79,10 @@ type ServerMessageGameEndedPayload struct {
 
 type ServerMessagePartyJoinedPayload struct {
 	PartyID PartyID `json:"partyId"`
+}
+
+type ServerMessageMemberUpdatePayload struct {
+	Members []PartyMemberInfo `json:"members"`
 }
 
 type ServerMessageQueueJoinedPayload struct{}
@@ -111,6 +114,10 @@ func UnmarshalServerMessage(msg ServerMessage) (any, error) {
 
 	case ServerMessageError:
 		var p ServerMessageErrorPayload
+		return p, json.Unmarshal(msg.Payload, &p)
+
+	case ServerMessageMemberUpdate:
+		var p ServerMessageMemberUpdatePayload
 		return p, json.Unmarshal(msg.Payload, &p)
 
 	default:
