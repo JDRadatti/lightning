@@ -156,11 +156,11 @@ func (p *Party) handleCommand(cmd PartyCommand) {
 			p.HostID = c.ID
 		}
 
-		c.SendMessage(ServerMessagePartyJoined, map[string]any{
-			"partyId": p.ID,
+		c.SendMessage(ServerMessagePartyJoined, ServerMessagePartyJoinedPayload{
+			PartyID: p.ID,
 		})
-		p.broadcast(ServerMessageMemberUpdate, map[string]any{
-			"memberCount": len(p.Members),
+		p.broadcast(ServerMessageMemberUpdate, ServerMessageMemberUpdatePayload{
+			Members: p.getMemberInfo(),
 		})
 
 		p.pm.PartyEvents <- PartyEvent{
@@ -192,8 +192,8 @@ func (p *Party) handleCommand(cmd PartyCommand) {
 			}
 		}
 
-		c.SendMessage(ServerMessagePartyLeft, map[string]any{
-			"reason": "self-initiated",
+		c.SendMessage(ServerMessagePartyLeft, ServerMessagePartyLeftPayload{
+			Reason: "self-initiated",
 		})
 
 		p.broadcast(ServerMessageMemberUpdate,

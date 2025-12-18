@@ -77,6 +77,10 @@ type ServerMessageGameEndedPayload struct {
 	Reason   string `json:"reason"`
 }
 
+type ServerMessagePartyLeftPayload struct {
+	Reason string `json:"reason"`
+}
+
 type ServerMessagePartyJoinedPayload struct {
 	PartyID PartyID `json:"partyId"`
 }
