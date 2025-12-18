@@ -24,6 +24,7 @@ const (
 	ErrorCodeInvalidRequest ServerErrorCode = "invalidRequest"
 	ErrorCodeAlreadyInParty ServerErrorCode = "alreadyInParty"
 	ErrorCodePartyNotFound  ServerErrorCode = "partyNotFound"
+	ErrorCodeNotPartyHost   ServerErrorCode = "notPartyHost"
 	ErrorCodeNotInSession   ServerErrorCode = "notInSession"
 	ErrorCodePartyFull      ServerErrorCode = "partyFull"
 	ErrorCodeQueueFull      ServerErrorCode = "queueFull"

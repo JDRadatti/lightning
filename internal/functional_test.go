@@ -391,3 +391,54 @@ func TestStartGame(t *testing.T) {
 		t.Fatalf("expected both clients to receive gameStarted (got %s, %s)", msgA.Type, msgB.Type)
 	}
 }
+
+// TestNonHostCannotStartGame verifies that the server returns an error
+// when a member who is not the host attempts to start the game.
+func TestNonHostCannotStartGame(t *testing.T) {
+	srv, _ := startTestServer(t)
+
+	// Connect Client A (becomes Host) and Client B (Member)
+	connA := wsDial(t, srv)
+	connB := wsDial(t, srv)
+
+	// Consume connectSuccess
+	_ = readMessage(t, connA, timeout)
+	_ = readMessage(t, connB, timeout)
+
+	// Client A joins to create a party
+	sendMessage(t, connA, ClientMessage{Type: ClientMessageJoin, Payload: json.RawMessage(`{"partyId": ""}`)})
+	_ = readMessage(t, connA, timeout) // queueJoined
+	msgJoinedA := readMessage(t, connA, timeout)
+
+	// Extract PartyID so B can join
+	payloadAny, _ := UnmarshalServerMessage(msgJoinedA)
+	plA := payloadAny.(ServerMessagePartyJoinedPayload)
+
+	// Client B joins A's party
+	rawB, _ := json.Marshal(map[string]any{"partyId": plA.PartyID})
+	sendMessage(t, connB, ClientMessage{Type: ClientMessageJoin, Payload: json.RawMessage(rawB)})
+	_ = readMessage(t, connB, timeout) // partyJoined
+	_ = readMessage(t, connB, timeout) // memberUpdate
+	_ = readMessage(t, connA, timeout) // memberUpdate
+
+	// Client B (Non-Host) attempts to start the game
+	sendMessage(t, connB, ClientMessage{
+		Type:    ClientMessageStartGame,
+		Payload: json.RawMessage(`{}`),
+	})
+
+	// Client B should receive an ErrorMessage (ErrorCodeNotPartyHost)
+	msgError := readMessage(t, connB, timeout)
+	if msgError.Type != ServerMessageError {
+		t.Fatalf("expected error message from non-host start attempt, got %s", msgError.Type)
+	}
+
+	// Verify the error code is specific to the host permission
+	payloadErr, _ := UnmarshalServerMessage(msgError)
+	plErr := payloadErr.(ServerMessageErrorPayload)
+	if plErr.Code != ErrorCodeNotPartyHost {
+		t.Fatalf("expected error code %s, got %s", ErrorCodeNotPartyHost, plErr.Code)
+	}
+
+	t.Logf("Server successfully rejected non-host start attempt with message: %s", plErr.Message)
+}

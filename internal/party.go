@@ -225,8 +225,18 @@ func (p *Party) handleCommand(cmd PartyCommand) {
 		)
 
 	case PartyCommandStartGame:
+		pl := cmd.Payload.(PartyCommandStartGamePayload)
+		c := pl.Client
+
+		// Only host can start the game
+		if c.ID != p.HostID {
+			c.SendError(ErrorCodeNotPartyHost, "Not party host.", ClientMessageStartGame)
+			return
+		}
+
 		game := NewGame(p.pm)
 		p.game = game
+		// This is safe because it happens before goroutine starts
 		for _, c := range p.Members {
 			game.AddClient(c)
 		}
