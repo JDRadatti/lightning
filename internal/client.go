@@ -4,24 +4,59 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"sync"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
 const (
+	// Time allowed to write a message to the peer.
+	writeWait = 10 * time.Second
+
+	// Time allowed to read the next pong message from the peer.
+	pongWait = 60 * time.Second
+
+	// Send pings to peer with this period. Must be less than pongWait.
+	pingPeriod = (pongWait * 9) / 10
+
+	// Maximum message size allowed from peer.
+	maxMessageSize = 512
+
+	// Size of the client's send buffer
 	sendBufferSize = 6
 )
 
 type ClientID string
 
-type Client struct {
-	ID   ClientID
-	conn *websocket.Conn
-	send chan ServerMessage
-	pm   *PartyManager
+// NewClientID creates a new ClientID.
+func NewClientID() ClientID {
+	return ClientID(uuid.New().String())
 }
 
-var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+// SecretKey validates a client.
+type SecretKey string
+
+// NewSecretKey creates a new SecretKey.
+func NewSecretKey() SecretKey {
+	return SecretKey(uuid.New().String())
+}
+
+type Client struct {
+	ID       ClientID
+	Secret   SecretKey
+	conn     *websocket.Conn
+	send     chan ServerMessage
+	pm       *PartyManager
+	lastPong time.Time
+	mu       sync.Mutex
+}
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+}
 
 // ServeWs is the main entrypoint of a client. It creates the Client object and
 // starts the read and write pumps.
@@ -32,16 +67,17 @@ func ServeWs(pm *PartyManager, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c := &Client{
-		ID:   ClientID(r.RemoteAddr),
-		conn: conn,
-		send: make(chan ServerMessage, sendBufferSize),
-		pm:   pm,
+		ID:     NewClientID(),
+		Secret: NewSecretKey(),
+		conn:   conn,
+		send:   make(chan ServerMessage, sendBufferSize),
+		pm:     pm,
 	}
 
 	go c.writePump()
 	go c.readPump()
 
-	c.SendMessage(ServerMessageConnectSuccess, ServerMessageConnectSuccessPayload{ClientID: c.ID})
+	c.SendMessage(ServerMessageConnectSuccess, ServerMessageConnectSuccessPayload{ClientID: c.ID, SecretKey: c.Secret})
 }
 
 // readPump pumps messages from the websocket connection to the hub.
@@ -50,7 +86,21 @@ func ServeWs(pm *PartyManager, w http.ResponseWriter, r *http.Request) {
 // ensures that there is at most one reader on a connection by executing all
 // reads from this goroutine.
 func (c *Client) readPump() {
-	defer c.conn.Close()
+	defer func() {
+		// Tell the PartyManager this client DISCONNECTED
+		c.pm.SendCommand(PartyManagerCommand{
+			Type:    PartyManagerCommandDisconnectClient,
+			Payload: PartyManagerDisconnectPayload{Client: c},
+		})
+		c.conn.Close()
+	}()
+	c.conn.SetReadLimit(maxMessageSize)
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
 	for {
 		var msg ClientMessage
 		err := c.conn.ReadJSON(&msg)
@@ -70,7 +120,7 @@ func (c *Client) readPump() {
 			if p, ok := payload.(ClientMessageJoinPayload); ok {
 				c.pm.SendCommand(PartyManagerCommand{
 					Type:    PartyManagerCommandAddClient,
-					Payload: PartyManagerAddClientPayload{Client: c, PartyID: p.PartyID},
+					Payload: PartyManagerAddClientPayload{Client: c, ClientID: p.ClientID, PartyID: p.PartyID, SecretKey: p.SecretKey},
 				})
 			}
 		case ClientMessageLeave:
@@ -99,11 +149,40 @@ func (c *Client) readPump() {
 // application ensures that there is at most one writer to a connection by
 // executing all writes from this goroutine.
 func (c *Client) writePump() {
-	defer c.Close()
-	for msg := range c.send {
-		if err := c.conn.WriteJSON(msg); err != nil {
-			log.Printf("write err: %v", err)
-			return
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+	for {
+		select {
+		case message, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			w, err := c.conn.NextWriter(websocket.TextMessage)
+			if err != nil {
+				return
+			}
+			data, err := json.Marshal(message)
+			if err != nil {
+				_ = w.Close()
+				return
+			}
+
+			_, _ = w.Write(data)
+
+			if err := w.Close(); err != nil {
+				return
+			}
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }

@@ -29,6 +29,7 @@ const (
 	ErrorCodeNotInSession     ServerErrorCode = "notInSession"
 	ErrorCodePartyFull        ServerErrorCode = "partyFull"
 	ErrorCodeQueueFull        ServerErrorCode = "queueFull"
+	ErrorCodeSessionExpired   ServerErrorCode = "expired"
 )
 
 const (
@@ -47,7 +48,9 @@ type ClientMessage struct {
 }
 
 type ClientMessageJoinPayload struct {
-	PartyID PartyID `json:"partyId"`
+	ClientID  ClientID  `json:"clientId"`
+	PartyID   PartyID   `json:"partyId"`
+	SecretKey SecretKey `json:"secret"`
 }
 
 type ClientMessageStartGamePayload struct {
@@ -66,7 +69,8 @@ type ServerMessage struct {
 }
 
 type ServerMessageConnectSuccessPayload struct {
-	ClientID ClientID `json:"clientId"`
+	ClientID  ClientID  `json:"clientId"`
+	SecretKey SecretKey `json:"secret"`
 }
 
 type ServerMessageGameStartedPayload struct {

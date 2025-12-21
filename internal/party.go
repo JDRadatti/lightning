@@ -26,9 +26,8 @@ func NewPartyID() PartyID {
 // is sent to the client each time a member's status
 // is updated.
 type PartyMemberInfo struct {
-	ID        string `json:"id"`
-	IsHost    bool   `json:"isHost"`
-	Connected bool   `json:"connected"`
+	ID     string `json:"id"`
+	IsHost bool   `json:"isHost"`
 }
 
 // ---------------------------------------------------------------------
@@ -57,6 +56,7 @@ const (
 	PartyCommandAddClient    PartyCommandType = "addClient"
 	PartyCommandRemoveClient PartyCommandType = "removeClient"
 	PartyCommandStartGame    PartyCommandType = "startGame"
+	PartyCommandCleanup      PartyCommandType = "cleanup"
 )
 
 // PartyCommand represents a message sent to a Party goroutine.
@@ -188,7 +188,7 @@ func (p *Party) handleCommand(cmd PartyCommand) {
 			Payload: PartyEventClientLeftPayload{ClientID: c.ID},
 		}
 
-		// If host left, disband this party
+		// If no members left, disband this party
 		if len(p.Members) == 0 {
 			p.pm.PartyEvents <- PartyEvent{Type: PartyEventDisbanded, PartyID: p.ID}
 			c.SendMessage(ServerMessagePartyLeft, ServerMessagePartyLeftPayload{
@@ -199,19 +199,10 @@ func (p *Party) handleCommand(cmd PartyCommand) {
 
 		// Check if host left
 		if p.HostID == c.ID {
-			if len(p.Members) == 0 {
-				// No members left, disband
-				p.pm.PartyEvents <- PartyEvent{
-					Type:    PartyEventDisbanded,
-					PartyID: p.ID,
-				}
-				return
-			} else {
-				// Pick the first remaining member as new host
-				for id := range p.Members {
-					p.HostID = id
-					break
-				}
+			// Pick the first remaining member as new host
+			for id := range p.Members {
+				p.HostID = id
+				break
 			}
 		}
 
@@ -277,9 +268,8 @@ func (p *Party) getMemberInfo() []PartyMemberInfo {
 	partyMembers := make([]PartyMemberInfo, 0, len(p.Members))
 	for _, m := range p.Members {
 		partyMembers = append(partyMembers, PartyMemberInfo{
-			ID:        string(m.ID),
-			IsHost:    p.HostID == m.ID,
-			Connected: true,
+			ID:     string(m.ID),
+			IsHost: p.HostID == m.ID,
 		})
 	}
 	return partyMembers

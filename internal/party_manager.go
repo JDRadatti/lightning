@@ -2,10 +2,15 @@ package internal
 
 import (
 	"log"
+	"time"
 )
 
 // buffer size for PartyManager channels
-const partyManagerBufferSize = 64
+const (
+	partyManagerBufferSize = 64
+	cleanupInterval        = 10 * time.Second
+	abandonmentTimeout     = 15 * time.Second
+)
 
 // ---------------------------------------------------------------------
 // Communication
@@ -28,9 +33,12 @@ const partyManagerBufferSize = 64
 type PartyManagerCommandType string
 
 const (
-	PartyManagerCommandAddClient    PartyManagerCommandType = "addClient"
-	PartyManagerCommandRemoveClient PartyManagerCommandType = "removeClient"
-	PartyManagerCommandStartGame    PartyManagerCommandType = "startGame"
+	PartyManagerCommandAddClient           PartyManagerCommandType = "addClient"
+	PartyManagerCommandRemoveClient        PartyManagerCommandType = "removeClient"
+	PartyManagerCommandStartGame           PartyManagerCommandType = "startGame"
+	PartyManagerCommandDisconnectClient    PartyManagerCommandType = "clientDisconnected"
+	PartyManagerCommandFinalizeAbandonment PartyManagerCommandType = "finalizeAbandonment"
+	PartyManagerCommandCleanup             PartyManagerCommandType = "cleanUp"
 )
 
 // PartyManagerCommand wraps a command and its payload,
@@ -43,8 +51,10 @@ type PartyManagerCommand struct {
 // PartyManagerAddClientPayload is used when a Client joins the queue
 // or attempts to join a specific Party.
 type PartyManagerAddClientPayload struct {
-	Client  *Client
-	PartyID PartyID
+	Client    *Client   // Current Client Session
+	ClientID  ClientID  // ClientID attempting to reconnect to
+	PartyID   PartyID   // PartyID attempting to join
+	SecretKey SecretKey // SecretKey, for reconnecting
 }
 
 // PartyManagerRemoveClientPayload is used when a Client wants to leave
@@ -53,10 +63,23 @@ type PartyManagerRemoveClientPayload struct {
 	Client *Client
 }
 
+// PartyManagerDisconnectPayload is used when a Client wants to leave
+// a Party or disconnects.
+type PartyManagerDisconnectPayload struct {
+	Client *Client
+}
+
 // PartyManagerStartGamePayload is sent when a Client wants to
 // start a Game.
 type PartyManagerStartGamePayload struct {
 	Client *Client
+}
+
+// abandonedPayload keeps track of important information related to
+// a client that was disconnected
+type AbandonedClient struct {
+	Client      *Client
+	AbandonedAt time.Time
 }
 
 // ---------------------------------------------------------------------
@@ -72,6 +95,7 @@ type PartyManager struct {
 	PublicParty *Party
 	Parties     map[PartyID]*Party
 	Members     map[ClientID]PartyID
+	Abandoned   map[ClientID]AbandonedClient
 	PublicQueue chan *Client
 
 	PartyEvents chan PartyEvent
@@ -85,12 +109,14 @@ func NewPartyManager() *PartyManager {
 		PublicParty: nil,
 		Parties:     make(map[PartyID]*Party),
 		Members:     make(map[ClientID]PartyID),
+		Abandoned:   make(map[ClientID]AbandonedClient),
 		PublicQueue: make(chan *Client, partyManagerBufferSize),
 		PartyEvents: make(chan PartyEvent, partyManagerBufferSize),
 		GameEvents:  make(chan GameEvent, partyManagerBufferSize),
 		Commands:    make(chan PartyManagerCommand, partyManagerBufferSize),
 	}
 	go pm.Run()
+	go pm.cleanupAbandoned()
 	return pm
 }
 
@@ -117,7 +143,27 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 	switch cmd.Type {
 	case PartyManagerCommandAddClient:
 		payload := cmd.Payload.(PartyManagerAddClientPayload)
-		client, partyID := payload.Client, payload.PartyID
+		client, clientID := payload.Client, payload.ClientID
+		partyID, secret := payload.PartyID, payload.SecretKey
+
+		// Check if client was abandoned and is within reconnection window
+		if abandonedClient, wasAbandoned := pm.Abandoned[clientID]; wasAbandoned {
+			if time.Since(abandonedClient.AbandonedAt) < abandonmentTimeout && secret == abandonedClient.Client.Secret {
+
+				// Update abandoned client with new connection and send channel
+				oldClient := abandonedClient.Client
+				oldClient.conn = client.conn
+				oldClient.send = client.send
+				client = oldClient
+
+				delete(pm.Abandoned, clientID)
+				log.Printf("Client %s reconnected", client.ID)
+			} else {
+				client.SendError(ErrorCodeSessionExpired, "Reconnection window expired.", ClientMessageJoin)
+				delete(pm.Abandoned, clientID)
+				return
+			}
+		}
 
 		if partyID == "" {
 			// client requested to join public queue
@@ -171,6 +217,26 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 				Client: client,
 			},
 		})
+
+	case PartyManagerCommandDisconnectClient:
+		// Client was disconnected
+		payload := cmd.Payload.(PartyManagerDisconnectPayload)
+		client := payload.Client
+		pm.Abandoned[client.ID] = AbandonedClient{
+			Client:      client,
+			AbandonedAt: time.Now(),
+		}
+		log.Printf("Client %s disconnected. Waiting %d to see if they return...", client.ID, abandonmentTimeout)
+
+	case PartyManagerCommandCleanup:
+		now := time.Now()
+		for cid, abandonedClient := range pm.Abandoned {
+			if now.Sub(abandonedClient.AbandonedAt) > abandonmentTimeout {
+				delete(pm.Abandoned, cid)
+				pm.removeClientFromParty(&Client{ID: cid}, "")
+				log.Printf("Client %s permanently removed after abandonment", cid)
+			}
+		}
 
 	default:
 		log.Printf("Unknown party manager command %s", cmd.Type)
@@ -263,4 +329,17 @@ func (pm *PartyManager) removeClientFromParty(c *Client, cmt ClientMessageType) 
 		Type:    PartyCommandRemoveClient,
 		Payload: PartyCommandRemoveClientPayload{Client: c},
 	})
+}
+
+// cleanupAbandoned is a goroutine that sends a
+// PartyManagerCommandCleanup every cleanupInterval
+func (pm *PartyManager) cleanupAbandoned() {
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		pm.SendCommand(PartyManagerCommand{
+			Type: PartyManagerCommandCleanup,
+		})
+	}
 }

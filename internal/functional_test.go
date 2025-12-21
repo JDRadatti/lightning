@@ -16,6 +16,20 @@ const timeout = 2 * time.Second
 // Helpers
 // ---------------------------------------------------------------------
 
+// TestClient wraps all session info needed to verify and reconnect a client.
+type TestClient struct {
+	Conn      *websocket.Conn
+	ID        ClientID
+	SecretKey SecretKey
+	PartyID   PartyID
+}
+
+type joinPayload struct {
+	ClientID string `json:"clientId"`
+	PartyID  string `json:"partyId"`
+	Secret   string `json:"secret,omitempty"`
+}
+
 // startTestServer starts a WebSocket server.
 // returns the websocket server and its PartyManager.
 func startTestServer(t *testing.T) (*httptest.Server, *PartyManager) {
@@ -84,24 +98,38 @@ func expectMessageType(t *testing.T, conn *websocket.Conn, target ServerMessageT
 }
 
 // connectAndJoin handles connecting, connectSuccess, and joining a party.
-func connectAndJoin(t *testing.T, srv *httptest.Server, partyID PartyID) (*websocket.Conn, PartyID) {
+func connectAndJoin(t *testing.T, srv *httptest.Server, jp joinPayload) *TestClient {
 	t.Helper()
 	conn := wsDial(t, srv)
 
-	expectMessageType(t, conn, ServerMessageConnectSuccess, timeout)
+	msgSuccess := expectMessageType(t, conn, ServerMessageConnectSuccess, timeout)
+	payloadAny, err := UnmarshalServerMessage(msgSuccess)
+	if err != nil {
+		t.Fatalf("failed to unmarshal connectSuccess: %v", err)
+	}
+	success := payloadAny.(ServerMessageConnectSuccessPayload)
 
-	payload := json.RawMessage(`{"partyId": "` + partyID + `"}`)
+	payloadBytes, _ := json.Marshal(jp)
+	payload := json.RawMessage(payloadBytes)
 	sendMessage(t, conn, ClientMessage{Type: ClientMessageJoin, Payload: payload})
 
-	msg := expectMessageType(t, conn, ServerMessagePartyJoined, 2*timeout)
+	msg := expectMessageType(t, conn, ServerMessagePartyJoined, timeout)
 
-	payloadAny, err := UnmarshalServerMessage(msg)
+	payloadAny, err = UnmarshalServerMessage(msg)
 	if err != nil {
 		t.Fatalf("failed to unmarshal partyJoined: %v", err)
 	}
 	pID := payloadAny.(ServerMessagePartyJoinedPayload).PartyID
 
-	return conn, PartyID(pID)
+	// Drain the MemberUpdate broadcast when joining
+	_ = expectMessageType(t, conn, ServerMessageMemberUpdate, timeout)
+
+	return &TestClient{
+		Conn:      conn,
+		ID:        ClientID(success.ClientID),
+		SecretKey: success.SecretKey,
+		PartyID:   PartyID(pID),
+	}
 }
 
 // readMessage reads and parses a ServerMessage within the given timeout.
@@ -136,11 +164,11 @@ func sendMessage(t *testing.T, conn *websocket.Conn, msg ClientMessage) {
 //	connect -> connectSuccess -> join -> partyJoined
 func TestConnectAndJoin(t *testing.T) {
 	srv, _ := startTestServer(t)
-	conn, partyID := connectAndJoin(t, srv, "")
-	defer conn.Close()
+	client := connectAndJoin(t, srv, joinPayload{})
+	defer client.Conn.Close()
 
-	if partyID == "" {
-		t.Fatal("expected valid partyID")
+	if client.PartyID == "" || client.SecretKey == "" {
+		t.Fatal("expected valid session data (PartyID and SecretKey)")
 	}
 }
 
@@ -162,13 +190,15 @@ func TestInvalidParty(t *testing.T) {
 func TestMultipleClients(t *testing.T) {
 	srv, _ := startTestServer(t)
 
-	connA, partyID := connectAndJoin(t, srv, "")
-	defer connA.Close()
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	defer clientA.Conn.Close()
 
-	connB, _ := connectAndJoin(t, srv, partyID)
-	defer connB.Close()
+	clientB := connectAndJoin(t, srv, joinPayload{
+		PartyID: string(clientA.PartyID),
+	})
+	defer clientB.Conn.Close()
 
-	t.Log("Both clients joined successfully")
+	t.Logf("Both clients joined successfully. Host: %s, Peer: %s", clientA.ID, clientB.ID)
 }
 
 // TestJoinWithPartyID verifies that a client can successfully join
@@ -176,14 +206,14 @@ func TestMultipleClients(t *testing.T) {
 func TestJoinWithPartyID(t *testing.T) {
 	srv, _ := startTestServer(t)
 
-	connA, partyID := connectAndJoin(t, srv, "")
-	defer connA.Close()
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	defer clientA.Conn.Close()
 
-	connB, bPartyID := connectAndJoin(t, srv, partyID)
-	defer connB.Close()
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientB.Conn.Close()
 
-	if partyID != bPartyID {
-		t.Fatalf("expected both clients in same party, got %s and %s", partyID, bPartyID)
+	if clientA.PartyID != clientB.PartyID {
+		t.Fatalf("expected both clients in same party, got %s and %s", clientA.PartyID, clientB.PartyID)
 	}
 }
 
@@ -211,23 +241,24 @@ func TestMalformedMessages(t *testing.T) {
 func TestPartyHostTransfer(t *testing.T) {
 	srv, _ := startTestServer(t)
 
-	connA, partyID := connectAndJoin(t, srv, "")
-	connB, _ := connectAndJoin(t, srv, partyID)
-	defer connB.Close()
-	defer connA.Close()
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientB.Conn.Close()
+	defer clientA.Conn.Close()
 
 	// Host (A) leaves
-	sendMessage(t, connA, ClientMessage{Type: ClientMessageLeave, Payload: json.RawMessage(`{}`)})
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessageLeave, Payload: json.RawMessage(`{}`)})
 
-	expectMessageType(t, connA, ServerMessagePartyLeft, 2*timeout)
+	expectMessageType(t, clientA.Conn, ServerMessagePartyLeft, timeout)
 
 	// B should get a memberUpdate reflecting the host transfer
-	updateMsg := expectMessageType(t, connB, ServerMessageMemberUpdate, 2*timeout)
+	updateMsg := expectMessageType(t, clientB.Conn, ServerMessageMemberUpdate, timeout)
 
 	payloadAny, err := UnmarshalServerMessage(updateMsg)
 	if err != nil {
 		t.Fatalf("failed to unmarshal memberUpdate: %v", err)
 	}
+
 	payloadBytes, _ := json.Marshal(payloadAny)
 	var memberUpdatePayload ServerMessageMemberUpdatePayload
 	if err := json.Unmarshal(payloadBytes, &memberUpdatePayload); err != nil {
@@ -236,7 +267,7 @@ func TestPartyHostTransfer(t *testing.T) {
 
 	var bIsHost bool
 	for _, m := range memberUpdatePayload.Members {
-		if m.ID != "" && m.IsHost {
+		if m.ID == string(clientB.ID) && m.IsHost {
 			bIsHost = true
 			break
 		}
@@ -252,15 +283,15 @@ func TestPartyHostTransfer(t *testing.T) {
 func TestStartGame(t *testing.T) {
 	srv, _ := startTestServer(t)
 
-	connA, partyID := connectAndJoin(t, srv, "")
-	connB, _ := connectAndJoin(t, srv, partyID)
-	defer connA.Close()
-	defer connB.Close()
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientA.Conn.Close()
+	defer clientB.Conn.Close()
 
-	sendMessage(t, connA, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
 
-	_ = expectMessageType(t, connA, ServerMessageGameStarted, timeout)
-	_ = expectMessageType(t, connB, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, clientA.Conn, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, clientB.Conn, ServerMessageGameStarted, timeout)
 }
 
 // TestNonHostCannotStartGame verifies that the server returns an error
@@ -268,13 +299,13 @@ func TestStartGame(t *testing.T) {
 func TestNonHostCannotStartGame(t *testing.T) {
 	srv, _ := startTestServer(t)
 
-	_, partyID := connectAndJoin(t, srv, "")
-	connB, _ := connectAndJoin(t, srv, partyID)
-	defer connB.Close()
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientB.Conn.Close()
 
-	sendMessage(t, connB, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
+	sendMessage(t, clientB.Conn, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
 
-	msgError := expectMessageType(t, connB, ServerMessageError, timeout)
+	msgError := expectMessageType(t, clientB.Conn, ServerMessageError, timeout)
 
 	payloadErr, _ := UnmarshalServerMessage(msgError)
 	plErr := payloadErr.(ServerMessageErrorPayload)
@@ -288,16 +319,136 @@ func TestNonHostCannotStartGame(t *testing.T) {
 func TestGameCannotStartWithSinglePlayer(t *testing.T) {
 	srv, _ := startTestServer(t)
 
-	connA, _ := connectAndJoin(t, srv, "")
-	defer connA.Close()
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	defer clientA.Conn.Close()
 
-	sendMessage(t, connA, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
 
-	msgError := expectMessageType(t, connA, ServerMessageError, timeout)
+	msgError := expectMessageType(t, clientA.Conn, ServerMessageError, timeout)
 
 	payloadErr, _ := UnmarshalServerMessage(msgError)
 	plErr := payloadErr.(ServerMessageErrorPayload)
 	if plErr.Code != ErrorCodeNotEnoughMembers {
 		t.Fatalf("expected error code %s, got %s", ErrorCodeNotEnoughMembers, plErr.Code)
+	}
+}
+
+// TestClientDisconnectAndReconnect verifies that a client can reconnect
+// within the abandonment window and continue in the party.
+func TestClientDisconnectAndReconnect(t *testing.T) {
+	srv, pm := startTestServer(t)
+
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{})
+	defer clientB.Conn.Close()
+
+	// A disconnects
+	clientA.Conn.Close()
+
+	// Wait a bit but within abandonment timeout
+	time.Sleep(5 * time.Second)
+
+	// A reconnects with same PartyID
+	clientA2 := connectAndJoin(t, srv, joinPayload{
+		ClientID: string(clientA.ID),
+		PartyID:  string(clientA.PartyID),
+		Secret:   string(clientA.SecretKey),
+	})
+	defer clientA2.Conn.Close()
+
+	// Add new Client and check that old ClientID is being used in MemberUpdate
+	_ = connectAndJoin(t, srv, joinPayload{})
+	defer clientB.Conn.Close()
+	// B should get a memberUpdate reflecting the reconnected user
+	_ = expectMessageType(t, clientB.Conn, ServerMessageMemberUpdate, timeout)
+	updateMsg := expectMessageType(t, clientB.Conn, ServerMessageMemberUpdate, timeout)
+
+	payloadAny, err := UnmarshalServerMessage(updateMsg)
+	if err != nil {
+		t.Fatalf("failed to unmarshal memberUpdate: %v", err)
+	}
+
+	payloadBytes, _ := json.Marshal(payloadAny)
+	var memberUpdatePayload ServerMessageMemberUpdatePayload
+	if err := json.Unmarshal(payloadBytes, &memberUpdatePayload); err != nil {
+		t.Fatalf("invalid memberUpdate payload shape: %v", err)
+	}
+
+	if len(memberUpdatePayload.Members) != 3 {
+		t.Fatal("There should be three members in the party")
+	}
+
+	var clientARejoined bool
+	for _, m := range memberUpdatePayload.Members {
+		if m.ID == string(clientA.ID) {
+			clientARejoined = true
+			break
+		}
+	}
+
+	// Client A should be in the member list now
+	if !clientARejoined {
+		t.Fatal("Client A failed ot rejoin")
+	}
+
+	// Both should still be in party
+	if _, stillAbandoned := pm.Abandoned[clientA.ID]; stillAbandoned {
+		t.Fatal("client should not be abandoned after reconnect")
+	}
+}
+
+// TestClientAbandonment verifies that after abandonmentTimeout,
+// a client is permanently removed from the party.
+func TestClientAbandonment(t *testing.T) {
+	srv, pm := startTestServer(t)
+
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{
+		PartyID: string(clientA.PartyID),
+	})
+	defer clientB.Conn.Close()
+
+	// A disconnects
+	clientA.Conn.Close()
+
+	// Wait for abandonment timeout + cleanup interval
+	time.Sleep(abandonmentTimeout + cleanupInterval + 500*time.Millisecond)
+
+	// A is no longer in Members
+	if _, inParty := pm.Members[clientA.ID]; inParty {
+		t.Fatal("abandoned client should be removed from party")
+	}
+
+	// Verify B is still in party
+	if _, inParty := pm.Members[clientB.ID]; !inParty {
+		t.Fatal("non-abandoned client should still be in party")
+	}
+}
+
+// TestReconnectAfterAbandonmentTimeout verifies that reconnecting
+// after abandonment timeout fails with SessionExpired error.
+func TestReconnectAfterAbandonmentTimeout(t *testing.T) {
+	srv, _ := startTestServer(t)
+
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	partyID := clientA.PartyID
+	clientA.Conn.Close()
+
+	// Wait for abandonment
+	time.Sleep(abandonmentTimeout + cleanupInterval + 500*time.Millisecond)
+
+	// Try to reconnect
+	conn := wsDial(t, srv)
+	defer conn.Close()
+
+	_ = expectMessageType(t, conn, ServerMessageConnectSuccess, timeout)
+
+	payload := json.RawMessage(`{"partyId": "` + string(partyID) + `"}`)
+	sendMessage(t, conn, ClientMessage{Type: ClientMessageJoin, Payload: payload})
+
+	// Should get error (party or session expired)
+	msgErr := expectMessageType(t, conn, ServerMessageError, timeout)
+	if msgErr.Type != ServerMessageError {
+		t.Fatalf("expected error, got %s", msgErr.Type)
 	}
 }
