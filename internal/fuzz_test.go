@@ -34,7 +34,7 @@ func FuzzProtocol(f *testing.F) {
 		t.Helper()
 
 		// Start an isolated in-memory server for each fuzz iteration.
-		pm := NewPartyManager()
+		pm := NewPartyManagerWithTimeouts(100*time.Millisecond, 50*time.Millisecond)
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ServeWs(pm, w, r)
 		}))

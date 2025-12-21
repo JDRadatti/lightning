@@ -96,24 +96,33 @@ type PartyManager struct {
 	Parties     map[PartyID]*Party
 	Members     map[ClientID]PartyID
 	Abandoned   map[ClientID]AbandonedClient
-	PublicQueue chan *Client
 
+	PublicQueue chan *Client
 	PartyEvents chan PartyEvent
 	GameEvents  chan GameEvent
 	Commands    chan PartyManagerCommand
+
+	AbandonmentTimeout time.Duration
+	CleanupInterval    time.Duration
 }
 
 // NewPartyManager starts and returns a new PartyManager.
 func NewPartyManager() *PartyManager {
+	return NewPartyManagerWithTimeouts(abandonmentTimeout, cleanupInterval)
+}
+
+func NewPartyManagerWithTimeouts(abandonmentTimeout, cleanupInterval time.Duration) *PartyManager {
 	pm := &PartyManager{
-		PublicParty: nil,
-		Parties:     make(map[PartyID]*Party),
-		Members:     make(map[ClientID]PartyID),
-		Abandoned:   make(map[ClientID]AbandonedClient),
-		PublicQueue: make(chan *Client, partyManagerBufferSize),
-		PartyEvents: make(chan PartyEvent, partyManagerBufferSize),
-		GameEvents:  make(chan GameEvent, partyManagerBufferSize),
-		Commands:    make(chan PartyManagerCommand, partyManagerBufferSize),
+		PublicParty:        nil,
+		Parties:            make(map[PartyID]*Party),
+		Members:            make(map[ClientID]PartyID),
+		Abandoned:          make(map[ClientID]AbandonedClient),
+		PublicQueue:        make(chan *Client, partyManagerBufferSize),
+		PartyEvents:        make(chan PartyEvent, partyManagerBufferSize),
+		GameEvents:         make(chan GameEvent, partyManagerBufferSize),
+		Commands:           make(chan PartyManagerCommand, partyManagerBufferSize),
+		AbandonmentTimeout: abandonmentTimeout,
+		CleanupInterval:    cleanupInterval,
 	}
 	go pm.Run()
 	go pm.cleanupAbandoned()
@@ -148,7 +157,7 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 
 		// Check if client was abandoned and is within reconnection window
 		if abandonedClient, wasAbandoned := pm.Abandoned[clientID]; wasAbandoned {
-			if time.Since(abandonedClient.AbandonedAt) < abandonmentTimeout && secret == abandonedClient.Client.Secret {
+			if time.Since(abandonedClient.AbandonedAt) < pm.AbandonmentTimeout && secret == abandonedClient.Client.Secret {
 
 				// Update abandoned client with new connection and send channel
 				oldClient := abandonedClient.Client
@@ -226,12 +235,12 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 			Client:      client,
 			AbandonedAt: time.Now(),
 		}
-		log.Printf("Client %s disconnected. Waiting %d to see if they return...", client.ID, abandonmentTimeout)
+		log.Printf("Client %s disconnected. Waiting %d to see if they return...", client.ID, pm.AbandonmentTimeout)
 
 	case PartyManagerCommandCleanup:
 		now := time.Now()
 		for cid, abandonedClient := range pm.Abandoned {
-			if now.Sub(abandonedClient.AbandonedAt) > abandonmentTimeout {
+			if now.Sub(abandonedClient.AbandonedAt) > pm.AbandonmentTimeout {
 				delete(pm.Abandoned, cid)
 				pm.removeClientFromParty(&Client{ID: cid}, "")
 				log.Printf("Client %s permanently removed after abandonment", cid)
@@ -334,7 +343,7 @@ func (pm *PartyManager) removeClientFromParty(c *Client, cmt ClientMessageType) 
 // cleanupAbandoned is a goroutine that sends a
 // PartyManagerCommandCleanup every cleanupInterval
 func (pm *PartyManager) cleanupAbandoned() {
-	ticker := time.NewTicker(cleanupInterval)
+	ticker := time.NewTicker(pm.CleanupInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {

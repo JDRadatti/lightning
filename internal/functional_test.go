@@ -34,7 +34,7 @@ type joinPayload struct {
 // returns the websocket server and its PartyManager.
 func startTestServer(t *testing.T) (*httptest.Server, *PartyManager) {
 	t.Helper()
-	pm := NewPartyManager()
+	pm := NewPartyManagerWithTimeouts(100*time.Millisecond, 50*time.Millisecond)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		ServeWs(pm, w, r)
@@ -346,7 +346,7 @@ func TestClientDisconnectAndReconnect(t *testing.T) {
 	clientA.Conn.Close()
 
 	// Wait a bit but within abandonment timeout
-	time.Sleep(5 * time.Second)
+	time.Sleep(5 * time.Millisecond)
 
 	// A reconnects with same PartyID
 	clientA2 := connectAndJoin(t, srv, joinPayload{
@@ -412,7 +412,7 @@ func TestClientAbandonment(t *testing.T) {
 	clientA.Conn.Close()
 
 	// Wait for abandonment timeout + cleanup interval
-	time.Sleep(abandonmentTimeout + cleanupInterval + 500*time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	// A is no longer in Members
 	if _, inParty := pm.Members[clientA.ID]; inParty {
@@ -435,7 +435,7 @@ func TestReconnectAfterAbandonmentTimeout(t *testing.T) {
 	clientA.Conn.Close()
 
 	// Wait for abandonment
-	time.Sleep(abandonmentTimeout + cleanupInterval + 500*time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	// Try to reconnect
 	conn := wsDial(t, srv)
