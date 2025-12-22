@@ -152,8 +152,10 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 	switch cmd.Type {
 	case PartyManagerCommandAddClient:
 		payload := cmd.Payload.(PartyManagerAddClientPayload)
-		client, clientID := payload.Client, payload.ClientID
-		partyID, secret := payload.PartyID, payload.SecretKey
+		client := payload.Client     // Current client
+		clientID := payload.ClientID // ClientID of previous client (for reconnnecting)
+		partyID := payload.PartyID   // PartyID that client is requesting to join
+		secret := payload.SecretKey  // Client secret (for reconnnecting)
 
 		// Check if client was abandoned and is within reconnection window
 		if abandonedClient, wasAbandoned := pm.Abandoned[clientID]; wasAbandoned {
