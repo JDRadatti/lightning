@@ -260,7 +260,7 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 			clientsMap[cid] = member.Client
 		}
 
-		game := NewGame(pm, clientsMap)
+		game := NewGame(pm, p, clientsMap)
 		p.game = game
 		pm.Games[game.ID] = game
 
@@ -370,7 +370,10 @@ func (pm *PartyManager) handleGameEvent(evt GameEvent) {
 				client.game = nil
 				client.mu.Unlock()
 			}
+			// Clear game reference in parent party
+			game.p.game = nil
 		}
+		delete(pm.Games, evt.GameID)
 	default:
 		log.Printf("Unknown game event type %s", evt.Type)
 	}

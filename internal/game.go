@@ -70,16 +70,18 @@ type Game struct {
 	ID       GameID
 	Clients  map[ClientID]*Client
 	pm       *PartyManager
+	p        *Party
 	commands chan GameCommand
 	mu       sync.RWMutex
 }
 
 // NewGame creates a new Game and initializes its command channel.
-func NewGame(pm *PartyManager, clients map[ClientID]*Client) *Game {
+func NewGame(pm *PartyManager, p *Party, clients map[ClientID]*Client) *Game {
 	return &Game{
 		ID:       NewGameID(),
 		Clients:  clients,
 		pm:       pm,
+		p:        p,
 		commands: make(chan GameCommand, 64),
 	}
 }
