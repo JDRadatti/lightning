@@ -545,3 +545,241 @@ func TestRapidReconnectAttempts(t *testing.T) {
 		t.Fatal("client should be in party")
 	}
 }
+
+// TestClientRemovedOnLeave - Verify client is removed from Members when they leave
+func TestClientRemovedOnLeave(t *testing.T) {
+	srv, pm := startTestServer(t)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientID := clientA.ID
+	partyID := clientA.PartyID
+
+	// Verify client is in Members
+	if _, inParty := pm.Members[clientID]; !inParty {
+		t.Fatal("client should be in Members after join")
+	}
+
+	// Client leaves
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessageLeave, Payload: json.RawMessage(`{}`)})
+	_ = expectMessageType(t, clientA.Conn, ServerMessagePartyLeft, timeout)
+
+	// Verify client is removed from Members
+	if _, inParty := pm.Members[clientID]; inParty {
+		t.Fatal("client should be removed from Members after leave")
+	}
+
+	// Party should not exist
+	if _, exists := pm.Parties[partyID]; exists {
+		t.Fatal("party should be disbanded when empty")
+	}
+}
+
+// TestClientRemovedOnAbandonment - Verify abandoned client is removed after timeout
+func TestClientRemovedOnAbandonment(t *testing.T) {
+	srv, pm := startTestServer(t)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientB.Conn.Close()
+
+	clientID := clientA.ID
+
+	// Verify client is in Members
+	if _, inParty := pm.Members[clientID]; !inParty {
+		t.Fatal("client should be in Members after join")
+	}
+
+	// A disconnects
+	clientA.Conn.Close()
+	time.Sleep(5 * time.Millisecond)
+
+	// Verify client is still in Members
+	if _, inParty := pm.Members[clientID]; !inParty {
+		t.Fatal("client should still be in Members while abandoned")
+	}
+
+	if _, isAbandoned := pm.Abandoned[clientID]; !isAbandoned {
+		t.Fatal("client should be in Abandoned")
+	}
+
+	// Wait for abandonment timeout
+	time.Sleep(150 * time.Millisecond)
+
+	// Verify client is removed from Members
+	if _, inParty := pm.Members[clientID]; inParty {
+		t.Fatal("client should be removed from Members after abandonment timeout")
+	}
+
+	// Verify client is removed from Abandoned
+	if _, isAbandoned := pm.Abandoned[clientID]; isAbandoned {
+		t.Fatal("client should be removed from Abandoned after cleanup")
+	}
+}
+
+// TestPartyRemovedWhenEmpty - Party is removed when last member leaves
+func TestPartyRemovedWhenEmpty(t *testing.T) {
+	srv, pm := startTestServer(t)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	partyID := clientA.PartyID
+
+	// Verify party exists
+	if _, exists := pm.Parties[partyID]; !exists {
+		t.Fatal("party should exist after client joins")
+	}
+
+	// Client leaves
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessageLeave, Payload: json.RawMessage(`{}`)})
+	_ = expectMessageType(t, clientA.Conn, ServerMessagePartyLeft, timeout)
+
+	// Verify party is removed
+	if _, exists := pm.Parties[partyID]; exists {
+		t.Fatal("party should be removed when empty")
+	}
+}
+
+// TestPartyRemovedWhenAllAbandonedTimeout - Party removed when all members abandoned
+func TestPartyRemovedWhenAllAbandonedTimeout(t *testing.T) {
+	srv, pm := startTestServer(t)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	partyID := clientA.PartyID
+
+	// Both disconnect
+	clientA.Conn.Close()
+	clientB.Conn.Close()
+	time.Sleep(5 * time.Millisecond)
+
+	// Party still exists (members are just abandoned)
+	if _, exists := pm.Parties[partyID]; !exists {
+		t.Fatal("party should still exist while members are abandoned")
+	}
+
+	// Wait for abandonment timeout
+	time.Sleep(150 * time.Millisecond)
+
+	// Party should be removed
+	if _, exists := pm.Parties[partyID]; exists {
+		t.Fatal("party should be removed when all members abandoned")
+	}
+}
+
+// TestGameRemovedOnEnd - Game is removed from Games map after ending
+func TestGameRemovedOnEnd(t *testing.T) {
+	srv, pm := startTestServer(t)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientA.Conn.Close()
+	defer clientB.Conn.Close()
+
+	// Start game
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
+	_ = expectMessageType(t, clientA.Conn, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, clientB.Conn, ServerMessageGameStarted, timeout)
+
+	// Get gameID from the party
+	partyID := clientA.PartyID
+	party := pm.Parties[partyID]
+	gameID := party.game.ID
+
+	// Verify game exists in Games map
+	if _, exists := pm.Games[gameID]; !exists {
+		t.Fatal("game should exist in Games map")
+	}
+
+	// End game by having player disconnect
+	clientA.Conn.Close()
+	time.Sleep(10 * time.Millisecond)
+
+	// B should receive game over
+	_ = expectMessageType(t, clientB.Conn, ServerMessageGameOver, timeout)
+	time.Sleep(10 * time.Millisecond)
+
+	// Game should be removed from Games map
+	if _, exists := pm.Games[gameID]; exists {
+		t.Fatal("game should be removed from Games map after ending")
+	}
+
+	// Game reference should be cleared from party
+	if party.game != nil {
+		t.Fatal("game reference should be cleared from party after ending")
+	}
+}
+
+// TestGameClientReferencesCleared - Client.game is nil after game ends
+func TestGameClientReferencesCleared(t *testing.T) {
+	srv, _ := startTestServer(t)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientB.Conn.Close()
+
+	// Start game
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
+	_ = expectMessageType(t, clientA.Conn, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, clientB.Conn, ServerMessageGameStarted, timeout)
+
+	// End game
+	clientA.Conn.Close()
+	time.Sleep(10 * time.Millisecond)
+
+	_ = expectMessageType(t, clientB.Conn, ServerMessageGameOver, timeout)
+	time.Sleep(10 * time.Millisecond)
+
+	// Try to send player action - should fail (not in game)
+	payload := json.RawMessage(`{"action": "flip"}`)
+	sendMessage(t, clientB.Conn, ClientMessage{Type: ClientMessagePlayerAction, Payload: payload})
+
+	msgErr := expectMessageType(t, clientB.Conn, ServerMessageError, timeout)
+	payloadErr, _ := UnmarshalServerMessage(msgErr)
+	if payloadErr.(ServerMessageErrorPayload).Code != ErrorCodeNotInGame {
+		t.Fatal("expected NotInGame error after game ends")
+	}
+}
+
+// TestPartyPersistsAfterGame - Party exists after game ends, ready for new game
+func TestPartyPersistsAfterGame(t *testing.T) {
+	srv, pm := startTestServer(t)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientA.Conn.Close()
+	defer clientB.Conn.Close()
+
+	partyID := clientA.PartyID
+
+	// Start game
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
+	_ = expectMessageType(t, clientA.Conn, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, clientB.Conn, ServerMessageGameStarted, timeout)
+
+	// End game by disconnecting
+	clientA.Conn.Close()
+	time.Sleep(10 * time.Millisecond)
+	_ = expectMessageType(t, clientB.Conn, ServerMessageGameOver, timeout)
+
+	// Reconnect A
+	clientA2 := connectAndJoin(t, srv, joinPayload{
+		ClientID: string(clientA.ID),
+		PartyID:  string(partyID),
+		Secret:   string(clientA.SecretKey),
+	})
+	defer clientA2.Conn.Close()
+
+	// Party should still exist and both clients in it
+	if _, exists := pm.Parties[partyID]; !exists {
+		t.Fatal("party should persist after game ends")
+	}
+
+	party := pm.Parties[partyID]
+	if len(party.Members) != 2 {
+		t.Fatalf("party should have 2 members, got %d", len(party.Members))
+	}
+
+	// Party should be ready for another game
+	if party.game != nil {
+		t.Fatal("party.game should be nil after previous game ended")
+	}
+
+	// Host can start a new game. Note: host was transfered to B when A left
+	sendMessage(t, clientB.Conn, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
+	newGameMsg := expectMessageType(t, clientB.Conn, ServerMessageGameStarted, timeout)
+	if newGameMsg.Type != ServerMessageGameStarted {
+		t.Fatal("should be able to start new game after previous one ended")
+	}
+}
