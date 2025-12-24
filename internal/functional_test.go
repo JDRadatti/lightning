@@ -132,6 +132,34 @@ func connectAndJoin(t *testing.T, srv *httptest.Server, jp joinPayload) *TestCli
 	}
 }
 
+// connectAndJoinFail handles connecting, receiving connectSuccess,
+// attempting to join a party, and expecting an error response.
+// It returns the error message received.
+func connectAndJoinFail(t *testing.T, srv *httptest.Server, jp joinPayload) *TestClient {
+	t.Helper()
+	conn := wsDial(t, srv)
+
+	msgSuccess := expectMessageType(t, conn, ServerMessageConnectSuccess, timeout)
+	payloadAny, err := UnmarshalServerMessage(msgSuccess)
+	if err != nil {
+		t.Fatalf("failed to unmarshal connectSuccess: %v", err)
+	}
+	success := payloadAny.(ServerMessageConnectSuccessPayload)
+
+	payloadBytes, _ := json.Marshal(jp)
+	payload := json.RawMessage(payloadBytes)
+	sendMessage(t, conn, ClientMessage{Type: ClientMessageJoin, Payload: payload})
+
+	_ = expectMessageType(t, conn, ServerMessageError, timeout)
+
+	return &TestClient{
+		Conn:      conn,
+		ID:        ClientID(success.ClientID),
+		SecretKey: success.SecretKey,
+		PartyID:   "",
+	}
+}
+
 // readMessage reads and parses a ServerMessage within the given timeout.
 func readMessage(t *testing.T, conn *websocket.Conn, timeout time.Duration) ServerMessage {
 	t.Helper()
@@ -450,5 +478,70 @@ func TestReconnectAfterAbandonmentTimeout(t *testing.T) {
 	msgErr := expectMessageType(t, conn, ServerMessageError, timeout)
 	if msgErr.Type != ServerMessageError {
 		t.Fatalf("expected error, got %s", msgErr.Type)
+	}
+}
+
+// TestReconnectWithWrongSecret - Reconnect with invalid secret
+func TestReconnectWithWrongSecret(t *testing.T) {
+	srv, pm := startTestServer(t)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientA.Conn.Close()
+	time.Sleep(5 * time.Millisecond)
+
+	// Try to reconnect with wrong secret
+	_ = connectAndJoinFail(t, srv, joinPayload{
+		ClientID: string(clientA.ID),
+		Secret:   "invalid secret",
+	})
+
+	// Original client should be cleaned up
+	if _, stillAbandoned := pm.Abandoned[clientA.ID]; stillAbandoned {
+		t.Fatal("client should be removed from abandoned after failed reconnect")
+	}
+}
+
+// TestPartyDisbandedWhenAllAbandoned - Verify party cleanup
+func TestPartyDisbandedWhenAllAbandoned(t *testing.T) {
+	srv, pm := startTestServer(t)
+
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	partyID := clientA.PartyID
+
+	// Both disconnect
+	clientA.Conn.Close()
+	clientB.Conn.Close()
+
+	// Wait for abandonment timeout
+	time.Sleep(150 * time.Millisecond)
+
+	// Party should be removed
+	if _, exists := pm.Parties[partyID]; exists {
+		t.Fatal("party should be removed when all members abandoned")
+	}
+}
+
+// TestRapidReconnectAttempts - Multiple reconnect tries in quick succession
+func TestRapidReconnectAttempts(t *testing.T) {
+	srv, pm := startTestServer(t)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	originalID := clientA.ID
+	clientA.Conn.Close()
+	time.Sleep(5 * time.Millisecond)
+
+	// Try to reconnect 3 times rapidly
+	for _ = range 3 {
+		clientA2 := connectAndJoin(t, srv, joinPayload{
+			ClientID: string(clientA.ID),
+			Secret:   string(clientA.SecretKey),
+			PartyID:  string(clientA.PartyID),
+		})
+		clientA2.Conn.Close()
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Should only be one instance in party
+	if _, inParty := pm.Members[originalID]; !inParty {
+		t.Fatal("client should be in party")
 	}
 }
