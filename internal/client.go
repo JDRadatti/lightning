@@ -44,13 +44,13 @@ func NewSecretKey() SecretKey {
 }
 
 type Client struct {
-	ID       ClientID
-	Secret   SecretKey
-	conn     *websocket.Conn
-	send     chan ServerMessage
-	pm       *PartyManager
-	lastPong time.Time
-	mu       sync.Mutex
+	ID     ClientID
+	Secret SecretKey
+	conn   *websocket.Conn
+	send   chan ServerMessage
+	pm     *PartyManager
+	game   *Game
+	mu     sync.Mutex
 }
 
 var upgrader = websocket.Upgrader{
@@ -135,6 +135,25 @@ func (c *Client) readPump() {
 				c.pm.SendCommand(PartyManagerCommand{
 					Type:    PartyManagerCommandStartGame,
 					Payload: PartyManagerStartGamePayload{Client: c},
+				})
+			}
+		case ClientMessagePlayerAction:
+			if p, ok := payload.(ClientMessagePlayerActionPayload); ok {
+				c.mu.Lock()
+				game := c.game
+				c.mu.Unlock()
+
+				if game == nil {
+					c.SendError(ErrorCodeNotInGame, "Not in a game.", msg.Type)
+					continue
+				}
+
+				game.SendCommand(GameCommand{
+					Type: GameCommandPlayerAction,
+					Payload: GameCommandPlayerActionPayload{
+						ClientID: c.ID,
+						Action:   p.Action,
+					},
 				})
 			}
 		default:

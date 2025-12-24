@@ -374,8 +374,8 @@ func TestClientDisconnectAndReconnect(t *testing.T) {
 		t.Fatalf("invalid memberUpdate payload shape: %v", err)
 	}
 
-	if len(memberUpdatePayload.Members) != 3 {
-		t.Fatal("There should be three members in the party")
+	if len(memberUpdatePayload.Members) != 2 {
+		t.Fatal("There should be two members in the party")
 	}
 
 	var clientARejoined bool

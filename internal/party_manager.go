@@ -12,33 +12,15 @@ const (
 	abandonmentTimeout     = 15 * time.Second
 )
 
-// ---------------------------------------------------------------------
-// Communication
-// ---------------------------------------------------------------------
-//
-// PartyManager → Party:
-//   PartyManager sends PartyCommands through each Party's `commands` channel.
-//
-// PartyManager ← Party,
-// PartyManager ← Game:
-//   PartyManager receives events from both Parties and Games through
-//   the `PartyEvents` and `GameEvents` channels.
-//
-// IMPORTANT: PartyManager, Party, Game, and Client each manage their own
-// fields only within their respective goroutine.
-// This ensures consistent access across goroutines and prevents data races.
-// ---------------------------------------------------------------------
-
 // PartyManagerCommandType lists all commands sent to the PartyManager.
 type PartyManagerCommandType string
 
 const (
-	PartyManagerCommandAddClient           PartyManagerCommandType = "addClient"
-	PartyManagerCommandRemoveClient        PartyManagerCommandType = "removeClient"
-	PartyManagerCommandStartGame           PartyManagerCommandType = "startGame"
-	PartyManagerCommandDisconnectClient    PartyManagerCommandType = "clientDisconnected"
-	PartyManagerCommandFinalizeAbandonment PartyManagerCommandType = "finalizeAbandonment"
-	PartyManagerCommandCleanup             PartyManagerCommandType = "cleanUp"
+	PartyManagerCommandAddClient        PartyManagerCommandType = "addClient"
+	PartyManagerCommandRemoveClient     PartyManagerCommandType = "removeClient"
+	PartyManagerCommandStartGame        PartyManagerCommandType = "startGame"
+	PartyManagerCommandDisconnectClient PartyManagerCommandType = "clientDisconnected"
+	PartyManagerCommandCleanup          PartyManagerCommandType = "cleanUp"
 )
 
 // PartyManagerCommand wraps a command and its payload,
@@ -75,19 +57,15 @@ type PartyManagerStartGamePayload struct {
 	Client *Client
 }
 
-// abandonedPayload keeps track of important information related to
+// AbandonedClient keeps track of important information related to
 // a client that was disconnected
 type AbandonedClient struct {
 	Client      *Client
 	AbandonedAt time.Time
 }
 
-// ---------------------------------------------------------------------
-// PartyManager
-// ---------------------------------------------------------------------
-
 // PartyManager owns all Parties, manages the public queue,
-// and receives events from both Parties and Games.
+// and receives events from Games.
 //
 // It runs as its own goroutine, processing commands through its internal
 // `Commands` channel.
@@ -96,9 +74,9 @@ type PartyManager struct {
 	Parties     map[PartyID]*Party
 	Members     map[ClientID]PartyID
 	Abandoned   map[ClientID]AbandonedClient
+	Games       map[GameID]*Game
 
 	PublicQueue chan *Client
-	PartyEvents chan PartyEvent
 	GameEvents  chan GameEvent
 	Commands    chan PartyManagerCommand
 
@@ -117,8 +95,8 @@ func NewPartyManagerWithTimeouts(abandonmentTimeout, cleanupInterval time.Durati
 		Parties:            make(map[PartyID]*Party),
 		Members:            make(map[ClientID]PartyID),
 		Abandoned:          make(map[ClientID]AbandonedClient),
+		Games:              make(map[GameID]*Game),
 		PublicQueue:        make(chan *Client, partyManagerBufferSize),
-		PartyEvents:        make(chan PartyEvent, partyManagerBufferSize),
 		GameEvents:         make(chan GameEvent, partyManagerBufferSize),
 		Commands:           make(chan PartyManagerCommand, partyManagerBufferSize),
 		AbandonmentTimeout: abandonmentTimeout,
@@ -130,7 +108,7 @@ func NewPartyManagerWithTimeouts(abandonmentTimeout, cleanupInterval time.Durati
 }
 
 // Run is the main loop of the PartyManager.
-// It processes incoming commands, queue joins, and events from Parties and Games.
+// It processes incoming commands and queue joins.
 func (pm *PartyManager) Run() {
 	for {
 		select {
@@ -138,8 +116,6 @@ func (pm *PartyManager) Run() {
 			pm.handleCommand(cmd)
 		case c := <-pm.PublicQueue:
 			pm.handleQueueJoin(c)
-		case evt := <-pm.PartyEvents:
-			pm.handlePartyEvent(evt)
 		case evt := <-pm.GameEvents:
 			pm.handleGameEvent(evt)
 		}
@@ -152,12 +128,15 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 	switch cmd.Type {
 	case PartyManagerCommandAddClient:
 		payload := cmd.Payload.(PartyManagerAddClientPayload)
-		client := payload.Client     // Current client
-		clientID := payload.ClientID // ClientID of previous client (for reconnnecting)
-		partyID := payload.PartyID   // PartyID that client is requesting to join
-		secret := payload.SecretKey  // Client secret (for reconnnecting)
+		client := payload.Client     // Client making join request
+		partyID := payload.PartyID   // PartyID of party client is requesting to join
+		clientID := payload.ClientID // Client ID of disconnected client (for reconnection)
+		secret := payload.SecretKey  // Secret of disconnected client (for reconnection)
 
-		// Check if client was abandoned and is within reconnection window
+		// Check if client was abandoned and is within reconnection window.
+		//
+		// If a client is attempting to reconnect, they will be automatically reconnected
+		// to the same party, if it still exists.
 		if abandonedClient, wasAbandoned := pm.Abandoned[clientID]; wasAbandoned {
 			if time.Since(abandonedClient.AbandonedAt) < pm.AbandonmentTimeout && secret == abandonedClient.Client.Secret {
 
@@ -167,13 +146,46 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 				oldClient.send = client.send
 				client = oldClient
 
+				// Check if client was in party
+				realPartyID, exists := pm.Members[clientID]
+				if !exists {
+					client.SendError(ErrorCodeSessionExpired, "Session expired.", ClientMessageJoin)
+					delete(pm.Abandoned, clientID)
+					return
+				}
+
+				if party, partyExists := pm.Parties[realPartyID]; partyExists {
+					party.MarkClientConnected(clientID)
+
+					// Reassign game
+					client.mu.Lock()
+					client.game = party.game
+					client.mu.Unlock()
+
+					// Notify client that they re-joined the party
+					client.SendMessage(ServerMessagePartyJoined, ServerMessagePartyJoinedPayload{
+						PartyID: partyID,
+					})
+					// Notify other party members
+					party.broadcast(ServerMessageMemberUpdate, ServerMessageMemberUpdatePayload{
+						Members: party.getMemberInfo(),
+					})
+
+				}
+
 				delete(pm.Abandoned, clientID)
 				log.Printf("Client %s reconnected", client.ID)
+				return // Done with reconnection
 			} else {
 				client.SendError(ErrorCodeSessionExpired, "Reconnection window expired.", ClientMessageJoin)
 				delete(pm.Abandoned, clientID)
 				return
 			}
+		}
+
+		// Check if client is already in a party
+		if _, inParty := pm.Members[client.ID]; inParty {
+			client.SendError(ErrorCodeAlreadyInParty, "Already In Party.", ClientMessageJoin)
 		}
 
 		if partyID == "" {
@@ -189,12 +201,17 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 
 		// attempt to join specific party
 		if p, ok := pm.Parties[partyID]; ok {
-			p.SendCommand(PartyCommand{
-				Type: PartyCommandAddClient,
-				Payload: PartyCommandAddClientPayload{
-					Client: client,
-				},
+			p.AddClient(client)
+			pm.Members[client.ID] = partyID
+
+			client.SendMessage(ServerMessagePartyJoined, ServerMessagePartyJoinedPayload{
+				PartyID: partyID,
 			})
+			p.broadcast(ServerMessageMemberUpdate, ServerMessageMemberUpdatePayload{
+				Members: p.getMemberInfo(),
+			})
+
+			log.Printf("Client %s joined party %s", client.ID, partyID)
 		} else {
 			client.SendError(ErrorCodePartyNotFound, "Party not found.", ClientMessageJoin)
 		}
@@ -217,33 +234,91 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 
 		// attempt to get the party
 		p, exists := pm.Parties[pid]
-		if !exists && p != nil {
-			client.SendError(ErrorCodePartyNotFound, "Party not found", ClientMessageJoin)
+		if !exists {
+			client.SendError(ErrorCodePartyNotFound, "Party not found", ClientMessageStartGame)
 			return
 		}
 
-		p.SendCommand(PartyCommand{
-			Type: PartyCommandStartGame,
-			Payload: PartyCommandStartGamePayload{
-				Client: client,
-			},
-		})
+		// Only host can start the game
+		if client.ID != p.HostID {
+			client.SendError(ErrorCodeNotPartyHost, "Not party host.", ClientMessageStartGame)
+			return
+		}
+		// Only start game if there is enough players
+		if len(p.Members) < minPartySize {
+			client.SendError(ErrorCodeNotEnoughMembers, "Party size is too small.", ClientMessageStartGame)
+			return
+		}
+
+		// Create and start game
+		clientsMap := make(map[ClientID]*Client)
+		for cid, member := range p.Members {
+			clientsMap[cid] = member.Client
+		}
+
+		game := NewGame(pm, clientsMap)
+		p.game = game
+		pm.Games[game.ID] = game
+
+		// Assign game to each client
+		for _, member := range p.Members {
+			member.Client.mu.Lock()
+			member.Client.game = game
+			member.Client.mu.Unlock()
+		}
+
+		game.Start()
+		game.SendCommand(GameCommand{Type: GameCommandStartGame})
+
+		log.Printf("Game %s started in party %s", game.ID, pid)
 
 	case PartyManagerCommandDisconnectClient:
-		// Client was disconnected
 		payload := cmd.Payload.(PartyManagerDisconnectPayload)
 		client := payload.Client
+
+		// Tell the party the client disconnected
+		if partyID, exists := pm.Members[client.ID]; exists {
+			if party, partyExists := pm.Parties[partyID]; partyExists {
+				party.MarkClientDisconnected(client.ID)
+
+				// Notify other party members
+				party.broadcast(ServerMessageMemberUpdate, ServerMessageMemberUpdatePayload{
+					Members: party.getMemberInfo(),
+				})
+			}
+		}
+
+		// Clear game reference
+		client.mu.Lock()
+		client.game = nil
+		client.mu.Unlock()
+
+		// Mark as abandoned
 		pm.Abandoned[client.ID] = AbandonedClient{
 			Client:      client,
 			AbandonedAt: time.Now(),
 		}
-		log.Printf("Client %s disconnected. Waiting %d to see if they return...", client.ID, pm.AbandonmentTimeout)
+		log.Printf("Client %s disconnected. Waiting %v to see if they return...", client.ID, pm.AbandonmentTimeout)
 
 	case PartyManagerCommandCleanup:
 		now := time.Now()
 		for cid, abandonedClient := range pm.Abandoned {
 			if now.Sub(abandonedClient.AbandonedAt) > pm.AbandonmentTimeout {
 				delete(pm.Abandoned, cid)
+
+				// notify the game that the player is permanently gone
+				if partyID, exists := pm.Members[cid]; exists {
+					if party, partyExists := pm.Parties[partyID]; partyExists {
+						if party.game != nil {
+							party.game.SendCommand(GameCommand{
+								Type: GameCommandClientDisconnect,
+								Payload: GameCommandClientDisconnectPayload{
+									ClientID: cid,
+								},
+							})
+						}
+					}
+				}
 				pm.removeClientFromParty(&Client{ID: cid}, "")
 				log.Printf("Client %s permanently removed after abandonment", cid)
 			}
@@ -251,7 +326,6 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 
 	default:
 		log.Printf("Unknown party manager command %s", cmd.Type)
-
 	}
 }
 
@@ -260,43 +334,22 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 func (pm *PartyManager) handleQueueJoin(c *Client) {
 	if pm.PublicParty == nil || pm.PublicParty.IsFull() {
 		pid := NewPartyID()
-		pm.PublicParty = NewParty(pm, pid)
+		pm.PublicParty = NewParty(pid)
 		pm.Parties[pid] = pm.PublicParty
-		go pm.PublicParty.Run()
 	}
-	pm.PublicParty.SendCommand(PartyCommand{
-		Type: PartyCommandAddClient,
-		Payload: PartyCommandAddClientPayload{
-			Client: c,
-		},
+	pm.PublicParty.AddClient(c)
+	pm.Members[c.ID] = pm.PublicParty.ID
+
+	c.SendMessage(ServerMessagePartyJoined, ServerMessagePartyJoinedPayload{
+		PartyID: pm.PublicParty.ID,
 	})
-}
+	pm.PublicParty.broadcast(ServerMessageMemberUpdate,
+		ServerMessageMemberUpdatePayload{
+			Members: pm.PublicParty.getMemberInfo(),
+		},
+	)
 
-// handlePartyEvent responds to events emitted by Parties.
-//
-// Most PartyManager state should be updated here. For example,
-// Only add a Client as a Member when they were sucessfully
-// added to a party (i.e. when PartyManager recieves a
-// PartyEventClientJoinedPayload)
-func (pm *PartyManager) handlePartyEvent(evt PartyEvent) {
-	switch evt.Type {
-	case PartyEventClientJoined:
-		pl := evt.Payload.(PartyEventClientJoinedPayload)
-		pm.Members[pl.ClientID] = evt.PartyID
-		log.Printf("Client %s joined party %s", pl.ClientID, evt.PartyID)
-
-	case PartyEventClientLeft:
-		pl := evt.Payload.(PartyEventClientLeftPayload)
-		delete(pm.Members, pl.ClientID)
-		log.Printf("Client left party %s", evt.PartyID)
-
-	case PartyEventDisbanded:
-		delete(pm.Parties, evt.PartyID)
-		log.Printf("Party disbanded %s", evt.PartyID)
-
-	default:
-		log.Printf("Unknonwn party event type %s", evt.Type)
-	}
+	log.Printf("Client %s joined public queue (party %s)", c.ID, pm.PublicParty.ID)
 }
 
 // handleGameEvent responds to events emitted by Games.
@@ -306,6 +359,14 @@ func (pm *PartyManager) handleGameEvent(evt GameEvent) {
 		log.Printf("Game %s started", evt.GameID)
 	case GameEventEnded:
 		log.Printf("Game %s ended", evt.GameID)
+		// Remove game reference from all clients in finished game
+		if game, exists := pm.Games[evt.GameID]; exists {
+			for _, client := range game.Clients {
+				client.mu.Lock()
+				client.game = nil
+				client.mu.Unlock()
+			}
+		}
 	default:
 		log.Printf("Unknown game event type %s", evt.Type)
 	}
@@ -336,10 +397,30 @@ func (pm *PartyManager) removeClientFromParty(c *Client, cmt ClientMessageType) 
 		return
 	}
 
-	p.SendCommand(PartyCommand{
-		Type:    PartyCommandRemoveClient,
-		Payload: PartyCommandRemoveClientPayload{Client: c},
-	})
+	p.RemoveClient(c.ID)
+	delete(pm.Members, c.ID)
+
+	// Send PartyManager a confirmation
+	if cmt != "" {
+		c.SendMessage(ServerMessagePartyLeft, ServerMessagePartyLeftPayload{
+			Reason: "self-initiated",
+		})
+	}
+
+	// If no members left, disband this party
+	if p.IsEmpty() {
+		delete(pm.Parties, pid)
+		log.Printf("Party %s disbanded", pid)
+		return
+	}
+
+	p.broadcast(ServerMessageMemberUpdate,
+		ServerMessageMemberUpdatePayload{
+			Members: p.getMemberInfo(),
+		},
+	)
+
+	log.Printf("Client left party %s", pid)
 }
 
 // cleanupAbandoned is a goroutine that sends a

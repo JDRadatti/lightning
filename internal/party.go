@@ -1,15 +1,12 @@
 package internal
 
 import (
-	"log"
-
 	"github.com/google/uuid"
 )
 
 const (
-	maxPartySize      = 6
-	minPartySize      = 2
-	commandBufferSize = 64
+	maxPartySize = 6
+	minPartySize = 2
 )
 
 // PartyID uniquely identifies a Party instance.
@@ -26,220 +23,72 @@ func NewPartyID() PartyID {
 // is sent to the client each time a member's status
 // is updated.
 type PartyMemberInfo struct {
-	ID     string `json:"id"`
-	IsHost bool   `json:"isHost"`
+	ID          string `json:"id"`
+	IsHost      bool   `json:"isHost"`
+	IsConnected bool   `json:"isConnected"`
 }
 
-// ---------------------------------------------------------------------
-// Communication
-// ---------------------------------------------------------------------
-//
-// Party → PartyManager:
-//   A Party emits PartyEvent messages on the PartyManager’s `PartyEvents` channel.
-//
-// Party → Game:
-//   A Party sends GameCommands to its Game via the Game’s `commands` channel.
-//
-// Party ← PartyManager:
-//   A Party receives PartyCommands from the PartyManager through its own
-//   internal `commands` channel.
-//
-// IMPORTANT: PartyManager, Party, Game, and Client each manage their own
-// fields only within their goroutine. This ensures deterministic behavior
-// and prevents data races.
-// ---------------------------------------------------------------------
-
-// PartyCommandType enumerates the supported command types a Party can handle.
-type PartyCommandType string
-
-const (
-	PartyCommandAddClient    PartyCommandType = "addClient"
-	PartyCommandRemoveClient PartyCommandType = "removeClient"
-	PartyCommandStartGame    PartyCommandType = "startGame"
-	PartyCommandCleanup      PartyCommandType = "cleanup"
-)
-
-// PartyCommand represents a message sent to a Party goroutine.
-type PartyCommand struct {
-	Type    PartyCommandType
-	Payload any
+// PartyMember carries info related to a client in a Party
+type PartyMember struct {
+	Client      *Client
+	IsConnected bool
 }
-
-// PartyCommandRemoveClientPayload carries info for removing a Client from the Party.
-type PartyCommandRemoveClientPayload struct {
-	Client *Client
-}
-
-// PartyCommandAddClientPayload carries info for adding a Client to the Party.
-type PartyCommandAddClientPayload struct {
-	Client *Client
-}
-
-// PartyCommandStartGamePayload carries info for starting a game. Client must be
-// the host.
-type PartyCommandStartGamePayload struct {
-	Client *Client
-}
-
-// ---------------------------------------------------------------------
-// Events
-// ---------------------------------------------------------------------
-
-// PartyEventType enumerates all event types a Party can send to the PartyManager.
-type PartyEventType string
-
-const (
-	PartyEventClientJoined PartyEventType = "clientJoined"
-	PartyEventClientLeft   PartyEventType = "clientLeft"
-	PartyEventDisbanded    PartyEventType = "partyDisbanded"
-)
-
-// PartyEvent represents events sent from a Party to the PartyManager.
-type PartyEvent struct {
-	Type    PartyEventType
-	PartyID PartyID
-	Payload any
-}
-
-// PartyEventClientJoinedPayload carries the details of a join event.
-type PartyEventClientJoinedPayload struct {
-	ClientID ClientID
-	Party    *Party
-}
-
-// PartyEventClientLeftPayload carries the details of a leave event.
-type PartyEventClientLeftPayload struct {
-	ClientID ClientID
-}
-
-// ---------------------------------------------------------------------
-// Party
-// ---------------------------------------------------------------------
 
 // Party represents a pre‑game lobby containing multiple Clients.
-// It manages membership, host assignment, and transitions to the Game stage.
-//
-// Parties run their own goroutine, handle commands from the PartyManager,
-// and report events back upstream through the PartyManager.PartyEvents channel.
+// It is now just a data structure managed by PartyManager.
 type Party struct {
-	ID       PartyID
-	Members  map[ClientID]*Client
-	HostID   ClientID
-	pm       *PartyManager
-	commands chan PartyCommand
-	state    string
-	game     *Game
+	ID      PartyID
+	Members map[ClientID]*PartyMember
+	HostID  ClientID
+	game    *Game
 }
 
-// NewParty creates a new Party, initializing its member map and command channel.
-func NewParty(pm *PartyManager, id PartyID) *Party {
+// NewParty creates a new Party, initializing its member map.
+func NewParty(id PartyID) *Party {
 	return &Party{
-		ID:       id,
-		Members:  make(map[ClientID]*Client),
-		pm:       pm,
-		commands: make(chan PartyCommand, commandBufferSize),
+		ID:      id,
+		Members: make(map[ClientID]*PartyMember),
 	}
 }
 
-// Run starts the main loop for this Party.
-// It listens for PartyCommands until the channel is closed.
-func (p *Party) Run() {
-	defer close(p.commands)
-	for cmd := range p.commands {
-		p.handleCommand(cmd)
+// AddClient adds a client to the party
+func (p *Party) AddClient(c *Client) {
+	p.Members[c.ID] = &PartyMember{Client: c, IsConnected: true}
+	if len(p.Members) == 1 {
+		p.HostID = c.ID
 	}
 }
 
-// handleCommand processes a PartyCommand and performs the corresponding action.
-func (p *Party) handleCommand(cmd PartyCommand) {
-	switch cmd.Type {
+// RemoveClient removes a client from the party
+func (p *Party) RemoveClient(cid ClientID) {
+	delete(p.Members, cid)
 
-	case PartyCommandAddClient:
-		pl := cmd.Payload.(PartyCommandAddClientPayload)
-		c := pl.Client
-
-		p.Members[c.ID] = c
-		if len(p.Members) == 1 {
-			p.HostID = c.ID
+	// Check if host left
+	if p.HostID == cid {
+		// Pick the first remaining member as new host
+		for id := range p.Members {
+			p.HostID = id
+			break
 		}
-
-		c.SendMessage(ServerMessagePartyJoined, ServerMessagePartyJoinedPayload{
-			PartyID: p.ID,
-		})
-		p.broadcast(ServerMessageMemberUpdate, ServerMessageMemberUpdatePayload{
-			Members: p.getMemberInfo(),
-		})
-
-		p.pm.PartyEvents <- PartyEvent{
-			Type:    PartyEventClientJoined,
-			PartyID: p.ID,
-			Payload: PartyEventClientJoinedPayload{ClientID: c.ID, Party: p},
-		}
-
-	case PartyCommandRemoveClient:
-		pl := cmd.Payload.(PartyCommandRemoveClientPayload)
-		c := pl.Client
-		delete(p.Members, c.ID)
-
-		// Send PartyManager a confirmation
-		p.pm.PartyEvents <- PartyEvent{
-			Type:    PartyEventClientLeft,
-			PartyID: p.ID,
-			Payload: PartyEventClientLeftPayload{ClientID: c.ID},
-		}
-
-		// If no members left, disband this party
-		if len(p.Members) == 0 {
-			p.pm.PartyEvents <- PartyEvent{Type: PartyEventDisbanded, PartyID: p.ID}
-			c.SendMessage(ServerMessagePartyLeft, ServerMessagePartyLeftPayload{
-				Reason: "party-disbanded",
-			})
-			return
-		}
-
-		// Check if host left
-		if p.HostID == c.ID {
-			// Pick the first remaining member as new host
-			for id := range p.Members {
-				p.HostID = id
-				break
-			}
-		}
-
-		c.SendMessage(ServerMessagePartyLeft, ServerMessagePartyLeftPayload{
-			Reason: "self-initiated",
-		})
-
-		p.broadcast(ServerMessageMemberUpdate,
-			ServerMessageMemberUpdatePayload{
-				Members: p.getMemberInfo(),
-			},
-		)
-
-	case PartyCommandStartGame:
-		pl := cmd.Payload.(PartyCommandStartGamePayload)
-		c := pl.Client
-
-		// Only host can start the game
-		if c.ID != p.HostID {
-			c.SendError(ErrorCodeNotPartyHost, "Not party host.", ClientMessageStartGame)
-			return
-		}
-		// Only start game if there is enought players
-		if len(p.Members) < minPartySize {
-			c.SendError(ErrorCodeNotEnoughMembers, "Party size is too small.", ClientMessageStartGame)
-			return
-		}
-
-		game := NewGame(p.pm)
-		p.game = game
-		// This is safe because it happens before goroutine starts
-		for _, c := range p.Members {
-			game.AddClient(c)
-		}
-		go game.Run()
-		game.SendCommand(GameCommand{Type: GameCommandStartGame})
 	}
+}
+
+// MarkClientDisconnected marks a client as disconnected
+func (p *Party) MarkClientDisconnected(cid ClientID) bool {
+	if member, exists := p.Members[cid]; exists {
+		member.IsConnected = false
+		return true
+	}
+	return false
+}
+
+// MarkClientConnected marks a client as connected
+func (p *Party) MarkClientConnected(cid ClientID) bool {
+	if member, exists := p.Members[cid]; exists {
+		member.IsConnected = true
+		return true
+	}
+	return false
 }
 
 // IsFull checks if the Party has reached its maximum member limit.
@@ -247,29 +96,26 @@ func (p *Party) IsFull() bool {
 	return len(p.Members) >= maxPartySize
 }
 
-// SendCommand safely queues a command for the Party goroutine.
-// Drops the command if the buffer is full.
-func (p *Party) SendCommand(cmd PartyCommand) {
-	select {
-	case p.commands <- cmd:
-	default:
-		log.Printf("Party %s command buffer full (%s)", p.ID, cmd.Type)
-	}
+// IsEmpty checks if the party has no members
+func (p *Party) IsEmpty() bool {
+	return len(p.Members) == 0
 }
 
 // broadcast sends a ServerMessage to all Clients currently in the Party.
 func (p *Party) broadcast(msgType ServerMessageType, payload any) {
-	for _, c := range p.Members {
-		c.SendMessage(msgType, payload)
+	for _, m := range p.Members {
+		m.Client.SendMessage(msgType, payload)
 	}
 }
 
+// getMemberInfo returns the PartyMemberInfo for all members
 func (p *Party) getMemberInfo() []PartyMemberInfo {
 	partyMembers := make([]PartyMemberInfo, 0, len(p.Members))
 	for _, m := range p.Members {
 		partyMembers = append(partyMembers, PartyMemberInfo{
-			ID:     string(m.ID),
-			IsHost: p.HostID == m.ID,
+			ID:          string(m.Client.ID),
+			IsHost:      p.HostID == m.Client.ID,
+			IsConnected: m.IsConnected,
 		})
 	}
 	return partyMembers

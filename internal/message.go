@@ -27,15 +27,17 @@ const (
 	ErrorCodeNotPartyHost     ServerErrorCode = "notPartyHost"
 	ErrorCodeNotEnoughMembers ServerErrorCode = "notEnoughMembers"
 	ErrorCodeNotInSession     ServerErrorCode = "notInSession"
+	ErrorCodeNotInGame        ServerErrorCode = "notInGame"
 	ErrorCodePartyFull        ServerErrorCode = "partyFull"
 	ErrorCodeQueueFull        ServerErrorCode = "queueFull"
 	ErrorCodeSessionExpired   ServerErrorCode = "expired"
 )
 
 const (
-	ClientMessageJoin      ClientMessageType = "join"
-	ClientMessageLeave     ClientMessageType = "leave"
-	ClientMessageStartGame ClientMessageType = "startGame"
+	ClientMessageJoin         ClientMessageType = "join"
+	ClientMessageLeave        ClientMessageType = "leave"
+	ClientMessageStartGame    ClientMessageType = "startGame"
+	ClientMessagePlayerAction ClientMessageType = "playerAction"
 )
 
 // ---------------------------------------------------------------------
@@ -53,11 +55,13 @@ type ClientMessageJoinPayload struct {
 	SecretKey SecretKey `json:"secret"`
 }
 
-type ClientMessageStartGamePayload struct {
-	PartyID PartyID `json:"partyId"`
-}
+type ClientMessageStartGamePayload struct{}
 
 type ClientMessageLeavePayload struct{}
+
+type ClientMessagePlayerActionPayload struct {
+	Action string `json:"action"`
+}
 
 // ---------------------------------------------------------------------
 // Server Messages
@@ -162,8 +166,14 @@ func UnmarshalClientMessage(msg ClientMessage) (any, error) {
 		}
 		return payload, nil
 
+	case ClientMessagePlayerAction:
+		var payload ClientMessagePlayerActionPayload
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			return nil, err
+		}
+		return payload, nil
+
 	default:
-		// Unknown or invalid message type
 		return nil, fmt.Errorf("unknown client message type: %s", msg.Type)
 	}
 }
