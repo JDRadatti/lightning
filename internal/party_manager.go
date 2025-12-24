@@ -404,7 +404,7 @@ func (pm *PartyManager) removeClientFromParty(c *Client, cmt ClientMessageType) 
 	p.RemoveClient(c.ID)
 	delete(pm.Members, c.ID)
 
-	// Send PartyManager a confirmation
+	// Send Client a confirmation
 	if cmt != "" {
 		c.SendMessage(ServerMessagePartyLeft, ServerMessagePartyLeftPayload{
 			Reason: "self-initiated",
