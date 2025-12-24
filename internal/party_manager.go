@@ -153,25 +153,29 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 					delete(pm.Abandoned, clientID)
 					return
 				}
-
-				if party, partyExists := pm.Parties[realPartyID]; partyExists {
-					party.MarkClientConnected(clientID)
-
-					// Reassign game
-					client.mu.Lock()
-					client.game = party.game
-					client.mu.Unlock()
-
-					// Notify client that they re-joined the party
-					client.SendMessage(ServerMessagePartyJoined, ServerMessagePartyJoinedPayload{
-						PartyID: partyID,
-					})
-					// Notify other party members
-					party.broadcast(ServerMessageMemberUpdate, ServerMessageMemberUpdatePayload{
-						Members: party.getMemberInfo(),
-					})
-
+				party, partyExists := pm.Parties[realPartyID]
+				if !partyExists {
+					// Party was disbanded while they were disconnected
+					delete(pm.Abandoned, clientID)
+					delete(pm.Members, clientID)
+					client.SendError(ErrorCodePartyNotFound, "Party no longer exists.", ClientMessageJoin)
+					return
 				}
+
+				// Party exists, reconnect to it
+				party.MarkClientConnected(clientID)
+				client.mu.Lock()
+				client.game = party.game
+				client.mu.Unlock()
+
+				// Notify client that they re-joined the party
+				client.SendMessage(ServerMessagePartyJoined, ServerMessagePartyJoinedPayload{
+					PartyID: partyID,
+				})
+				// Notify other party members
+				party.broadcast(ServerMessageMemberUpdate, ServerMessageMemberUpdatePayload{
+					Members: party.getMemberInfo(),
+				})
 
 				delete(pm.Abandoned, clientID)
 				log.Printf("Client %s reconnected", client.ID)
@@ -410,6 +414,12 @@ func (pm *PartyManager) removeClientFromParty(c *Client, cmt ClientMessageType) 
 	// If no members left, disband this party
 	if p.IsEmpty() {
 		delete(pm.Parties, pid)
+
+		// If this was the public party, clear the reference
+		if pm.PublicParty != nil && pm.PublicParty.ID == pid {
+			pm.PublicParty = nil
+		}
+
 		log.Printf("Party %s disbanded", pid)
 		return
 	}
