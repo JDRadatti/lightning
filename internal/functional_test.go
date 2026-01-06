@@ -783,3 +783,403 @@ func TestPartyPersistsAfterGame(t *testing.T) {
 		t.Fatal("should be able to start new game after previous one ended")
 	}
 }
+
+// TestPlayerActionInGame verifies that players can send actions during gameplay
+func TestPlayerActionInGame(t *testing.T) {
+	srv, _ := startTestServer(t)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientA.Conn.Close()
+	defer clientB.Conn.Close()
+
+	// Start game
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
+	_ = expectMessageType(t, clientA.Conn, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, clientB.Conn, ServerMessageGameStarted, timeout)
+
+	// Send player action
+	payload := json.RawMessage(`{"action": "flip"}`)
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessagePlayerAction, Payload: payload})
+
+	// Action should be processed without error (no error message expected)
+	// The action is logged, so we just verify no error is returned
+	clientA.Conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	_, data, err := clientA.Conn.ReadMessage()
+	if err == nil {
+		// If we get a message, it should not be an error
+		var msg ServerMessage
+		if err := json.Unmarshal(data, &msg); err == nil && msg.Type == ServerMessageError {
+			t.Fatalf("unexpected error during player action: %s", string(data))
+		}
+	}
+	// Timeout is expected - no response means action was processed successfully
+}
+
+// TestPlayerActionNotInGame verifies error when sending action outside of game
+func TestPlayerActionNotInGame(t *testing.T) {
+	srv, _ := startTestServer(t)
+	client := connectAndJoin(t, srv, joinPayload{})
+	defer client.Conn.Close()
+
+	// Send player action without being in game
+	payload := json.RawMessage(`{"action": "flip"}`)
+	sendMessage(t, client.Conn, ClientMessage{Type: ClientMessagePlayerAction, Payload: payload})
+
+	msgErr := expectMessageType(t, client.Conn, ServerMessageError, timeout)
+	payloadErr, _ := UnmarshalServerMessage(msgErr)
+	if payloadErr.(ServerMessageErrorPayload).Code != ErrorCodeNotInGame {
+		t.Fatalf("expected NotInGame error, got %s", payloadErr.(ServerMessageErrorPayload).Code)
+	}
+}
+
+// TestInvalidPlayerAction verifies error handling for malformed action payloads
+func TestInvalidPlayerAction(t *testing.T) {
+	srv, _ := startTestServer(t)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientA.Conn.Close()
+	defer clientB.Conn.Close()
+
+	// Start game
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
+	_ = expectMessageType(t, clientA.Conn, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, clientB.Conn, ServerMessageGameStarted, timeout)
+
+	// Send malformed player action (invalid JSON) - send raw bytes
+	rawMsg := []byte(`{"type":"playerAction","payload":"invalid json"}`)
+	if err := clientA.Conn.WriteMessage(websocket.TextMessage, rawMsg); err != nil {
+		t.Fatalf("write raw message failed: %v", err)
+	}
+
+	// Should receive error for malformed payload
+	msgErr := expectMessageType(t, clientA.Conn, ServerMessageError, timeout)
+	payloadErr, _ := UnmarshalServerMessage(msgErr)
+	if payloadErr.(ServerMessageErrorPayload).Code != ErrorCodeInvalidRequest {
+		t.Fatalf("expected InvalidRequest error, got %s", payloadErr.(ServerMessageErrorPayload).Code)
+	}
+}
+
+// TestPlayerActionAfterGameEnd verifies actions are rejected after game ends
+func TestPlayerActionAfterGameEnd(t *testing.T) {
+	srv, _ := startTestServer(t)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientA.Conn.Close()
+	defer clientB.Conn.Close()
+
+	// Start game
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
+	_ = expectMessageType(t, clientA.Conn, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, clientB.Conn, ServerMessageGameStarted, timeout)
+
+	// End game by having host disconnect
+	clientA.Conn.Close()
+	time.Sleep(10 * time.Millisecond)
+	_ = expectMessageType(t, clientB.Conn, ServerMessageGameOver, timeout)
+
+	// Try to send player action after game ended
+	payload := json.RawMessage(`{"action": "flip"}`)
+	sendMessage(t, clientB.Conn, ClientMessage{Type: ClientMessagePlayerAction, Payload: payload})
+
+	msgErr := expectMessageType(t, clientB.Conn, ServerMessageError, timeout)
+	payloadErr, _ := UnmarshalServerMessage(msgErr)
+	if payloadErr.(ServerMessageErrorPayload).Code != ErrorCodeNotInGame {
+		t.Fatalf("expected NotInGame error after game ends, got %s", payloadErr.(ServerMessageErrorPayload).Code)
+	}
+}
+
+// TestPublicQueueJoin verifies clients can join the public queue
+func TestPublicQueueJoin(t *testing.T) {
+	srv, pm := startTestServer(t)
+
+	// First client joins public queue (no PartyID specified)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	defer clientA.Conn.Close()
+
+	// Should have created a public party
+	if pm.PublicParty == nil {
+		t.Fatal("public party should be created when first client joins queue")
+	}
+
+	if clientA.PartyID != pm.PublicParty.ID {
+		t.Fatalf("client should join public party, got %s, expected %s",
+			clientA.PartyID, pm.PublicParty.ID)
+	}
+}
+
+// TestPublicQueueFull verifies new party creation when current one is full
+func TestPublicQueueFull(t *testing.T) {
+	srv, pm := startTestServer(t)
+
+	// Fill up to public party to max capacity
+	var clients []*TestClient
+	for i := 0; i < maxPartySize; i++ {
+		client := connectAndJoin(t, srv, joinPayload{})
+		clients = append(clients, client)
+		defer client.Conn.Close()
+	}
+
+	// Get current public party ID before new client joins
+	currentPublicPartyID := pm.PublicParty.ID
+
+	// Next client should create a new party since public is full
+	clientExtra := connectAndJoin(t, srv, joinPayload{})
+	defer clientExtra.Conn.Close()
+
+	// Should have created a new public party
+	if clientExtra.PartyID == currentPublicPartyID {
+		t.Fatal("extra client should have created new public party")
+	}
+
+	// Verify public party reference updated
+	if pm.PublicParty.ID != clientExtra.PartyID {
+		t.Fatal("public party reference should have updated to new party")
+	}
+}
+
+// TestMultipleClientsPublicQueue verifies multiple clients joining queue
+func TestMultipleClientsPublicQueue(t *testing.T) {
+	srv, pm := startTestServer(t)
+
+	// Multiple clients join public queue
+	var clients []*TestClient
+	for i := 0; i < 3; i++ {
+		client := connectAndJoin(t, srv, joinPayload{})
+		clients = append(clients, client)
+		defer client.Conn.Close()
+	}
+
+	// All should be in the same public party
+	publicPartyID := pm.PublicParty.ID
+	for i, client := range clients {
+		if client.PartyID != publicPartyID {
+			t.Fatalf("client %d should be in public party %s, got %s",
+				i, publicPartyID, client.PartyID)
+		}
+	}
+
+	// Verify party has all members
+	if len(pm.PublicParty.Members) != 3 {
+		t.Fatalf("public party should have 3 members, got %d", len(pm.PublicParty.Members))
+	}
+}
+
+// TestPublicQueueBehaviorWhenFull verifies new party creation when full
+func TestPublicQueueBehaviorWhenFull(t *testing.T) {
+	srv, pm := startTestServer(t)
+
+	// Fill up first public party
+	var firstPartyClients []*TestClient
+	for _ = range maxPartySize {
+		client := connectAndJoin(t, srv, joinPayload{})
+		firstPartyClients = append(firstPartyClients, client)
+		defer client.Conn.Close()
+	}
+
+	firstPartyID := pm.PublicParty.ID
+
+	// Next client should trigger new public party creation
+	clientNew := connectAndJoin(t, srv, joinPayload{})
+	defer clientNew.Conn.Close()
+
+	// Should be in a different party
+	if clientNew.PartyID == firstPartyID {
+		t.Fatal("new client should be in different party when first is full")
+	}
+
+	// Public party reference should have changed
+	if pm.PublicParty.ID == firstPartyID {
+		t.Fatal("public party reference should have changed to new party")
+	}
+
+	// New client should be the new public party's host
+	newParty := pm.Parties[clientNew.PartyID]
+	if newParty.HostID != clientNew.ID {
+		t.Fatal("new client should be host of new public party")
+	}
+}
+
+// TestPartyAtMaxCapacity verifies joining a party at max capacity fails
+func TestPartyAtMaxCapacity(t *testing.T) {
+	srv, _ := startTestServer(t)
+
+	// Create a party and fill it to max capacity
+	var clients []*TestClient
+	var partyID PartyID
+	for _ = range maxPartySize {
+		var client *TestClient
+		client = connectAndJoin(t, srv, joinPayload{})
+		partyID = client.PartyID
+		clients = append(clients, client)
+		defer client.Conn.Close()
+	}
+
+	// Try to add one more client to the fill party
+	newClient := connectAndJoinFail(t, srv, joinPayload{PartyID: string(partyID)})
+	defer newClient.Conn.Close()
+
+}
+
+// TestInvalidMessageFormats verifies error handling for malformed messages
+func TestInvalidMessageFormats(t *testing.T) {
+	srv, _ := startTestServer(t)
+	conn := wsDial(t, srv)
+	defer conn.Close()
+
+	_ = expectMessageType(t, conn, ServerMessageConnectSuccess, timeout)
+
+	// Test completely invalid JSON
+	invalidJSON := []byte(`{"type":"join","payload":}`)
+	if err := conn.WriteMessage(websocket.TextMessage, invalidJSON); err != nil {
+		t.Fatalf("write invalid JSON failed: %v", err)
+	}
+
+	// Should receive error for invalid JSON or connection close
+	conn.SetReadDeadline(time.Now().Add(timeout))
+	_, data, err := conn.ReadMessage()
+	if err != nil {
+		// Connection closing is acceptable behavior for invalid JSON
+		return
+	}
+
+	// If we get a message, it should be an error
+	var msg ServerMessage
+	if err := json.Unmarshal(data, &msg); err == nil && msg.Type == ServerMessageError {
+		payloadErr, _ := UnmarshalServerMessage(msg)
+		if payloadErr.(ServerMessageErrorPayload).Code != ErrorCodeInvalidRequest {
+			t.Fatalf("expected InvalidRequest error for invalid JSON, got %s", payloadErr.(ServerMessageErrorPayload).Code)
+		}
+	}
+}
+
+// TestUnknownMessageType verifies error handling for unknown message types
+func TestUnknownMessageType(t *testing.T) {
+	srv, _ := startTestServer(t)
+	conn := wsDial(t, srv)
+	defer conn.Close()
+
+	_ = expectMessageType(t, conn, ServerMessageConnectSuccess, timeout)
+
+	// Send message with unknown type
+	unknownMsg := json.RawMessage(`{"payload":{}}`)
+	sendMessage(t, conn, ClientMessage{Type: "unknownMessage", Payload: unknownMsg})
+
+	// Should receive error for unknown message type
+	msgErr := expectMessageType(t, conn, ServerMessageError, timeout)
+	payloadErr, _ := UnmarshalServerMessage(msgErr)
+	if payloadErr.(ServerMessageErrorPayload).Code != ErrorCodeInvalidRequest {
+		t.Fatalf("expected InvalidRequest error for unknown message type, got %s", payloadErr.(ServerMessageErrorPayload).Code)
+	}
+}
+
+// TestGameEndsOnPlayerDisconnect verifies game ends when enough players disconnect
+func TestGameEndsOnPlayerDisconnect(t *testing.T) {
+	srv, _ := startTestServer(t)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	clientC := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientC.Conn.Close()
+
+	// Start game with 3 players
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
+	_ = expectMessageType(t, clientA.Conn, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, clientB.Conn, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, clientC.Conn, ServerMessageGameStarted, timeout)
+
+	// Disconnect 2 players (leaving only 1, which is < minPartySize)
+	clientA.Conn.Close()
+	clientB.Conn.Close()
+	time.Sleep(10 * time.Millisecond)
+
+	// Remaining player should receive game over
+	_ = expectMessageType(t, clientC.Conn, ServerMessageGameOver, timeout)
+}
+
+// TestCantJoinGamesInProgressFromQueue verifies that when a game is in progress,
+// new clients joining public queue are placed in a new party, not the one with ongoing game
+func TestCantJoinGamesInProgressFromQueue(t *testing.T) {
+	srv, pm := startTestServer(t)
+
+	// Start a game with less than max size clients (3 players)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	clientC := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientA.Conn.Close()
+	defer clientB.Conn.Close()
+	defer clientC.Conn.Close()
+
+	// Start game
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
+	_ = expectMessageType(t, clientA.Conn, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, clientB.Conn, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, clientC.Conn, ServerMessageGameStarted, timeout)
+
+	// Get party ID of the game in progress
+	gamePartyID := clientA.PartyID
+
+	// Now a new client joins public queue
+	clientD := connectAndJoin(t, srv, joinPayload{})
+	defer clientD.Conn.Close()
+
+	// The new client should be in a different party than the one with the game
+	if clientD.PartyID == gamePartyID {
+		t.Fatalf("new client should be in different party, got same party %s", clientD.PartyID)
+	}
+
+	// Verify there are now two separate parties
+	if len(pm.Parties) != 2 {
+		t.Fatalf("expected at least 2 parties, got %d", len(pm.Parties))
+	}
+
+	// Verify the original party still exists and has a game
+	originalParty, exists := pm.Parties[gamePartyID]
+	if !exists {
+		t.Fatal("original party should still exist")
+	}
+
+	if originalParty.game == nil {
+		t.Fatal("original party should still have a game")
+	}
+
+	// Find the party that the new client joined
+	newParty := pm.Parties[clientD.PartyID]
+	if newParty == nil {
+		t.Fatal("new party should exist")
+	}
+
+	if newParty.game != nil {
+		t.Fatal("new party should not have a game")
+	}
+
+	if len(newParty.Members) != 1 {
+		t.Fatalf("new party should have 1 member, got %d", len(newParty.Members))
+	}
+
+	if _, exists := newParty.Members[clientD.ID]; !exists {
+		t.Fatal("new client should be in the new party")
+	}
+}
+
+// TestCantJoinGamesInProgressFromPartyID verifies that when a game is in progress,
+// new clients cannot join an ongoing game via party ID.
+func TestCantJoinGamesInProgressFromPartyID(t *testing.T) {
+	srv, _ := startTestServer(t)
+
+	// Start a game with less than max size clients (3 players)
+	clientA := connectAndJoin(t, srv, joinPayload{})
+	clientB := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	clientC := connectAndJoin(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientA.Conn.Close()
+	defer clientB.Conn.Close()
+	defer clientC.Conn.Close()
+
+	// Start game
+	sendMessage(t, clientA.Conn, ClientMessage{Type: ClientMessageStartGame, Payload: json.RawMessage(`{}`)})
+	_ = expectMessageType(t, clientA.Conn, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, clientB.Conn, ServerMessageGameStarted, timeout)
+	_ = expectMessageType(t, clientC.Conn, ServerMessageGameStarted, timeout)
+
+	// Now a new client joins via partyID
+	clientD := connectAndJoinFail(t, srv, joinPayload{PartyID: string(clientA.PartyID)})
+	defer clientD.Conn.Close()
+}
