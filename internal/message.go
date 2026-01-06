@@ -30,6 +30,7 @@ const (
 	ErrorCodeNotInGame        ServerErrorCode = "notInGame"
 	ErrorCodePartyFull        ServerErrorCode = "partyFull"
 	ErrorCodeQueueFull        ServerErrorCode = "queueFull"
+	ErrorCodeGameInProgress   ServerErrorCode = "gameInProgress"
 	ErrorCodeSessionExpired   ServerErrorCode = "expired"
 )
 

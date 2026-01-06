@@ -205,6 +205,14 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 
 		// attempt to join specific party
 		if p, ok := pm.Parties[partyID]; ok {
+
+			// Check if party already has an ongoing game
+			if p.game != nil {
+				client.SendError(ErrorCodeGameInProgress, "Failed to join Party: game in progress.", ClientMessageJoin)
+			} else if p.IsFull() {
+				client.SendError(ErrorCodePartyFull, "Failed to join Party: already at max capacity.", ClientMessageJoin)
+			}
+
 			p.AddClient(client)
 			pm.Members[client.ID] = partyID
 
@@ -336,7 +344,7 @@ func (pm *PartyManager) handleCommand(cmd PartyManagerCommand) {
 // handleQueueJoin pulls clients off the public queue,
 // creates a new Party if needed, and adds the client to that Party.
 func (pm *PartyManager) handleQueueJoin(c *Client) {
-	if pm.PublicParty == nil || pm.PublicParty.IsFull() {
+	if pm.PublicParty == nil || pm.PublicParty.IsFull() || pm.PublicParty.game != nil {
 		pid := NewPartyID()
 		pm.PublicParty = NewParty(pid)
 		pm.Parties[pid] = pm.PublicParty
@@ -421,6 +429,11 @@ func (pm *PartyManager) removeClientFromParty(c *Client, cmt ClientMessageType) 
 		// If this was the public party, clear the reference
 		if pm.PublicParty != nil && pm.PublicParty.ID == pid {
 			pm.PublicParty = nil
+		}
+
+		// Remove game reference
+		if p.game != nil {
+			delete(pm.Games, p.game.ID)
 		}
 
 		log.Printf("Party %s disbanded", pid)
